@@ -4345,6 +4345,26 @@ rules:
       - update
 ---
 # Source: calico/templates/calico-node-rbac.yaml
+#CNI cluster role
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadate:
+  name: calico-cni-plugin
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+      - namespaces
+    verbs:
+      - get
+  - apiGroups: [""]
+    resources:
+      - pods/status
+    verbs:
+      - patch
+---
+# Source: calico/templates/calico-node-rbac.yaml
 # Flannel ClusterRole
 # Pulled from https://github.com/coreos/flannel/blob/master/Documentation/kube-flannel-rbac.yml
 kind: ClusterRole
@@ -4410,6 +4430,20 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: canal
+  namespace: kube-system
+---
+# Source: calico/templates/calico-node-rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: canal-cni-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: calico-cni-plugin
+subject:
+  kind: ServiceAccount
+  name: canal-cni-plugin
   namespace: kube-system
 ---
 # Source: calico/templates/calico-node.yaml

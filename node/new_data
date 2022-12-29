@@ -1,0 +1,37 @@
+{
+  "apiVersion": "projectcalico.org/v3",
+  "items": [
+    {
+      "apiVersion": "projectcalico.org/v3",
+      "kind": "FelixConfiguration",
+      "metadata": {
+        "name": "default",
+        "resourceVersion": "4609",
+        "uid": "19ecf46c-5b54-4fc0-a5cc-46ab2857fb01"
+      },
+      "spec": {
+        "bpfLogLevel": "",
+        "floatingIPs": "Disabled",
+        "ipipEnabled": false
+      }
+    },
+    {
+      "apiVersion": "projectcalico.org/v3",
+      "kind": "FelixConfiguration",
+      "metadata": {
+        "name": "node.michal",
+        "resourceVersion": "4527",
+        "uid": "c7ca2fc2-cba3-40c4-93a4-4b65d8ff467b"
+      },
+      "spec": {
+        "bpfLogLevel": "",
+        "defaultEndpointToHostAction": "Return",
+        "floatingIPs": "Disabled"
+      }
+    }
+  ],
+  "kind": "FelixConfigurationList",
+  "metadata": {
+    "resourceVersion": "4627"
+  }
+}
