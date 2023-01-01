@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	defaultServiceAccountName      = "calico-node"
+	defaultServiceAccountName      = "calico-cni-plugin"
 	serviceAccountNamespace        = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 	tokenFile                      = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	defaultCNITokenValiditySeconds = 24 * 60 * 60
