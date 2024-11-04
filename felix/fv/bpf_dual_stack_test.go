@@ -26,26 +26,23 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/projectcalico/calico/felix/bpf/ifstate"
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	. "github.com/projectcalico/calico/felix/fv/connectivity"
-	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
-
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	options2 "github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
@@ -59,7 +56,7 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 	if !BPFMode() {
 		return true
 	}
-	desc := fmt.Sprintf("_BPF-SAFE_ BPF dual stack basic in-cluster connectivity tests (ct = %v)", ctlbEnabled)
+	desc := fmt.Sprintf("_BPF_ _BPF-SAFE_ BPF dual stack basic in-cluster connectivity tests (ct=%v)", ctlbEnabled)
 	return infrastructure.DatastoreDescribe(desc, []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
 		var (
 			infra        infrastructure.DatastoreInfra
@@ -273,8 +270,8 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 		if !ipv6Dataplane {
 			JustBeforeEach(func() {
 				tc.TriggerDelayedStart()
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, nil)
-				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready, nil)
+				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, nil)
+				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready, ifstate.FlgHEP, nil)
 			})
 			It("should drop ipv6 packets at workload interface and allow ipv6 packets at host interface when in IPv4 only mode", func() {
 				// IPv4 connectivity must work.
@@ -365,8 +362,8 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 
 				tc.TriggerDelayedStart()
 
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, nil)
-				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, nil)
+				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, nil)
+				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, ifstate.FlgHEP, nil)
 				cc.ExpectSome(w[0][1], w[0][0])
 				cc.ExpectSome(w[1][0], w[0][0])
 				cc.ExpectSome(w[1][1], w[0][0])
@@ -398,7 +395,7 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 				_, err = k8sClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
 				Expect(err).NotTo(HaveOccurred())
 
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, nil)
+				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, ifstate.FlgHEP, nil)
 				cc.ExpectSome(w[0][1], w[0][0])
 				cc.ExpectSome(w[1][0], w[0][0])
 				cc.ExpectSome(w[1][1], w[0][0])
@@ -413,8 +410,8 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 				tc.TriggerDelayedStart()
 				externalClient := infrastructure.RunExtClient("ext-client")
 				_ = externalClient
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, nil)
-				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, nil)
+				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, ifstate.FlgHEP, nil)
+				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, ifstate.FlgHEP, nil)
 
 				tcpdump := externalClient.AttachTCPDump("any")
 				tcpdump.SetLogEnabled(true)
@@ -466,13 +463,12 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 					ensureBPFProgramsAttachedOffsetWithIPVersion(1, f, false, true, "eth0")
 				}
 
-				felixReady := func(f *infrastructure.Felix) int {
-					return healthStatus("["+f.IPv6+"]", "9099", "readiness")
-				}
-
 				for _, f := range tc.Felixes {
-					Eventually(felixReady(f), "10s", "330ms").Should(BeGood())
-					Consistently(felixReady(f), "10s", "1s").Should(BeGood())
+					felixReady := func() int {
+						return healthStatus("["+f.IPv6+"]", "9099", "readiness")
+					}
+					Eventually(felixReady, "10s", "330ms").Should(BeGood())
+					Consistently(felixReady, "10s", "1s").Should(BeGood())
 				}
 
 				cc.Expect(None, w[0][1], w[0][0])
@@ -502,13 +498,12 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 					ensureBPFProgramsAttachedOffsetWithIPVersion(1, f, true, false, "eth0")
 				}
 
-				felixReady := func(f *infrastructure.Felix) int {
-					return healthStatus(f.IP, "9099", "readiness")
-				}
-
 				for _, f := range tc.Felixes {
-					Eventually(felixReady(f), "10s", "330ms").Should(BeGood())
-					Consistently(felixReady(f), "10s", "1s").Should(BeGood())
+					felixReady := func() int {
+						return healthStatus(f.IP, "9099", "readiness")
+					}
+					Eventually(felixReady, "10s", "330ms").Should(BeGood())
+					Consistently(felixReady, "10s", "1s").Should(BeGood())
 				}
 
 				cc.Expect(None, w[0][1], w[0][0], ExpectWithIPVersion(6))
@@ -559,9 +554,9 @@ func removeIPv6Address(k8sClient *kubernetes.Clientset, felix *infrastructure.Fe
 	felix.Exec("ip", "-6", "addr", "del", felix.Container.IPv6+"/64", "dev", "eth0")
 }
 
-func ensureRightIFStateFlags(felix *infrastructure.Felix, ready uint32, additionalInterfaces map[string]uint32) {
+func ensureRightIFStateFlags(felix *infrastructure.Felix, ready uint32, hostIfType uint32, additionalInterfaces map[string]uint32) {
 	expectedIfacesToFlags := map[string]uint32{
-		"eth0": ifstate.FlgHEP | ready,
+		"eth0": hostIfType | ready,
 	}
 
 	if additionalInterfaces != nil {

@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
+	"sigs.k8s.io/knftables"
 
 	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
 	"github.com/projectcalico/calico/felix/deltatracker"
@@ -30,9 +32,6 @@ import (
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/logutils"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
-	log "github.com/sirupsen/logrus"
-	"sigs.k8s.io/knftables"
 )
 
 var _ dpsets.IPSetsDataplane = &IPSets{}
@@ -569,7 +568,7 @@ func (s *IPSets) NFTablesSet(name string) *knftables.Set {
 		return nil
 	}
 
-	flags := make([]knftables.SetFlag, 0, 1)
+	var flags []knftables.SetFlag
 	switch metadata.Type {
 	case ipsets.IPSetTypeHashIPPort:
 		// IP and port sets don't support the interval flag.

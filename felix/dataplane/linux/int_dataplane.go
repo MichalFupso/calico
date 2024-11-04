@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,17 +27,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"k8s.io/client-go/kubernetes"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
-	"github.com/projectcalico/calico/felix/dataplane/linux/dataplanedefs"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/bpfmap"
@@ -53,9 +50,11 @@ import (
 	bpfroutes "github.com/projectcalico/calico/felix/bpf/routes"
 	"github.com/projectcalico/calico/felix/bpf/tc"
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
+	bpfutils "github.com/projectcalico/calico/felix/bpf/utils"
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/dataplane/common"
 	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
+	"github.com/projectcalico/calico/felix/dataplane/linux/dataplanedefs"
 	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/idalloc"
@@ -66,10 +65,12 @@ import (
 	"github.com/projectcalico/calico/felix/jitter"
 	"github.com/projectcalico/calico/felix/labelindex"
 	"github.com/projectcalico/calico/felix/logutils"
+	"github.com/projectcalico/calico/felix/netlinkshim"
 	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/routerule"
 	"github.com/projectcalico/calico/felix/routetable"
+	"github.com/projectcalico/calico/felix/routetable/ownershippol"
 	"github.com/projectcalico/calico/felix/rules"
 	"github.com/projectcalico/calico/felix/throttle"
 	"github.com/projectcalico/calico/felix/vxlanfdb"
@@ -158,7 +159,8 @@ type Config struct {
 	DeviceRouteSourceAddressIPv6   net.IP
 	DeviceRouteProtocol            netlink.RouteProtocol
 	RemoveExternalRoutes           bool
-	IptablesRefreshInterval        time.Duration
+	IPForwarding                   string
+	TableRefreshInterval           time.Duration
 	IptablesPostWriteCheckInterval time.Duration
 	IptablesInsertMode             string
 	IptablesLockFilePath           string
@@ -224,6 +226,7 @@ type Config struct {
 	BPFEnforceRPF                      string
 	BPFDisableGROForIfaces             *regexp.Regexp
 	BPFExcludeCIDRsFromNAT             []string
+	BPFRedirectToPeer                  string
 	KubeProxyMinSyncPeriod             time.Duration
 	SidecarAccelerationEnabled         bool
 	ServiceLoopPrevention              string
@@ -285,12 +288,13 @@ type InternalDataplane struct {
 	fromDataplane           chan interface{}
 	sendDataplaneInSyncOnce sync.Once
 
-	allTables    []generictables.Table
-	mangleTables []generictables.Table
-	natTables    []generictables.Table
-	rawTables    []generictables.Table
-	filterTables []generictables.Table
-	ipSets       []dpsets.IPSetsDataplane
+	mainRouteTables []routetable.SyncerInterface
+	allTables       []generictables.Table
+	mangleTables    []generictables.Table
+	natTables       []generictables.Table
+	rawTables       []generictables.Table
+	filterTables    []generictables.Table
+	ipSets          []dpsets.IPSetsDataplane
 
 	ipipManager *ipipManager
 
@@ -377,14 +381,18 @@ const (
 )
 
 func NewIntDataplaneDriver(config Config) *InternalDataplane {
+	if config.BPFLogLevel == "info" {
+		config.BPFLogLevel = "off"
+	}
+
 	log.WithField("config", config).Info("Creating internal dataplane driver.")
 	ruleRenderer := config.RuleRendererOverride
 	if ruleRenderer == nil {
 		ruleRenderer = rules.NewRenderer(config.RulesConfig)
 	}
 	epMarkMapper := rules.NewEndpointMarkMapper(
-		config.RulesConfig.IptablesMarkEndpoint,
-		config.RulesConfig.IptablesMarkNonCaliEndpoint)
+		config.RulesConfig.MarkEndpoint,
+		config.RulesConfig.MarkNonCaliEndpoint)
 
 	// Auto-detect host MTU.
 	hostMTU, err := findHostMTU(config.MTUIfacePattern)
@@ -434,7 +442,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 	iptablesOptions := iptables.TableOptions{
 		HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
 		InsertMode:            config.IptablesInsertMode,
-		RefreshInterval:       config.IptablesRefreshInterval,
+		RefreshInterval:       config.TableRefreshInterval,
 		PostWriteInterval:     config.IptablesPostWriteCheckInterval,
 		LockTimeout:           config.IptablesLockTimeout,
 		LockProbeInterval:     config.IptablesLockProbeInterval,
@@ -444,7 +452,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		OpRecorder:            dp.loopSummarizer,
 	}
 	nftablesOptions := nftables.TableOptions{
-		RefreshInterval:  config.IptablesRefreshInterval,
+		RefreshInterval:  config.TableRefreshInterval,
 		LookPathOverride: config.LookPathOverride,
 		OnStillAlive:     dp.reportHealth,
 		OpRecorder:       dp.loopSummarizer,
@@ -566,30 +574,77 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 
 	dp.ipSets = append(dp.ipSets, ipSetsV4)
 
-	if config.RulesConfig.VXLANEnabled {
-		var routeTableVXLAN routetable.RouteTableInterface
-		if !config.RouteSyncDisabled {
-			log.Debug("RouteSyncDisabled is false.")
-			routeTableVXLAN = routetable.New([]string{"^" + dataplanedefs.VXLANIfaceNameV4 + "$"}, 4, config.NetlinkTimeout,
-				config.DeviceRouteSourceAddress, config.DeviceRouteProtocol, true, unix.RT_TABLE_MAIN,
-				dp.loopSummarizer, featureDetector, routetable.WithLivenessCB(dp.reportHealth))
-		} else {
-			log.Info("RouteSyncDisabled is true, using DummyTable.")
-			routeTableVXLAN = &routetable.DummyTable{}
-		}
+	var routeTableV4 routetable.Interface
+	var routeTableV6 routetable.Interface
 
+	if !config.RouteSyncDisabled {
+		log.Debug("Route management is enabled.")
+		routeTableV4 = routetable.New(
+			ownershippol.NewMainTable(
+				dataplanedefs.VXLANIfaceNameV4,
+				config.DeviceRouteProtocol,
+				config.RulesConfig.WorkloadIfacePrefixes,
+				config.RemoveExternalRoutes,
+			),
+			4,
+			config.NetlinkTimeout,
+			config.DeviceRouteSourceAddress,
+			config.DeviceRouteProtocol,
+			config.RemoveExternalRoutes,
+			unix.RT_TABLE_MAIN,
+			dp.loopSummarizer,
+			featureDetector,
+			routetable.WithStaticARPEntries(true),
+			routetable.WithLivenessCB(dp.reportHealth),
+			routetable.WithRouteCleanupGracePeriod(routeCleanupGracePeriod),
+		)
+		if config.IPv6Enabled {
+			routeTableV6 = routetable.New(
+				ownershippol.NewMainTable(
+					dataplanedefs.VXLANIfaceNameV6,
+					config.DeviceRouteProtocol,
+					config.RulesConfig.WorkloadIfacePrefixes,
+					config.RemoveExternalRoutes,
+				),
+				6,
+				config.NetlinkTimeout,
+				config.DeviceRouteSourceAddressIPv6,
+				config.DeviceRouteProtocol,
+				config.RemoveExternalRoutes,
+				unix.RT_TABLE_MAIN,
+				dp.loopSummarizer,
+				featureDetector,
+				// Note: deliberately not including:
+				// - Static neighbor entries: we've never supported these for IPv6;
+				//   we let the kernel populate them.
+				routetable.WithLivenessCB(dp.reportHealth),
+				routetable.WithRouteCleanupGracePeriod(routeCleanupGracePeriod),
+			)
+		}
+	} else {
+		log.Info("Route management is disabled, using DummyTables.")
+		routeTableV4 = &routetable.DummyTable{}
+		if config.IPv6Enabled {
+			routeTableV6 = &routetable.DummyTable{}
+		}
+	}
+	dp.mainRouteTables = append(dp.mainRouteTables, routeTableV4)
+	if routeTableV6 != nil {
+		dp.mainRouteTables = append(dp.mainRouteTables, routeTableV6)
+	}
+
+	if config.RulesConfig.VXLANEnabled {
 		vxlanFDB := vxlanfdb.New(netlink.FAMILY_V4, dataplanedefs.VXLANIfaceNameV4, featureDetector, config.NetlinkTimeout)
 		dp.vxlanFDBs = append(dp.vxlanFDBs, vxlanFDB)
 
 		dp.vxlanManager = newVXLANManager(
 			ipSetsV4,
-			routeTableVXLAN,
+			routeTableV4,
 			vxlanFDB,
 			dataplanedefs.VXLANIfaceNameV4,
 			config,
 			dp.loopSummarizer,
 			4,
-			featureDetector,
 		)
 		dp.vxlanParentC = make(chan string, 1)
 		go dp.vxlanManager.KeepVXLANDeviceInSync(context.Background(), config.VXLANMTU, dataplaneFeatures.ChecksumOffloadBroken, 10*time.Second, dp.vxlanParentC)
@@ -709,7 +764,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			log.WithError(err).Info("Failed to remove BPF connect-time load balancer, ignoring.")
 		}
 		tc.CleanUpProgramsAndPins()
-		removeBPFSpecialDevices()
+		bpfutils.RemoveBPFSpecialDevices()
 	} else {
 		// In BPF mode we still use iptables for raw egress policy.
 		dp.RegisterManager(newRawEgressPolicyManager(rawTableV4, ruleRenderer, 4, ipSetsV4.SetFilter))
@@ -786,7 +841,8 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			filterTableV6,
 			dp.reportHealth,
 			dp.loopSummarizer,
-			featureDetector,
+			routeTableV4,
+			routeTableV6,
 			config.HealthAggregator,
 			dataplaneFeatures,
 			podMTU,
@@ -843,19 +899,6 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 				log.WithError(err).Warn("Failed to detach connect-time load balancer. Ignoring.")
 			}
 		}
-	}
-
-	var routeTableV4 routetable.RouteTableInterface
-
-	if !config.RouteSyncDisabled {
-		log.Debug("RouteSyncDisabled is false.")
-		routeTableV4 = routetable.New(interfaceRegexes, 4, config.NetlinkTimeout,
-			config.DeviceRouteSourceAddress, config.DeviceRouteProtocol, config.RemoveExternalRoutes, unix.RT_TABLE_MAIN,
-			dp.loopSummarizer, featureDetector, routetable.WithLivenessCB(dp.reportHealth),
-			routetable.WithRouteCleanupGracePeriod(routeCleanupGracePeriod))
-	} else {
-		log.Info("RouteSyncDisabled is true, using DummyTable.")
-		routeTableV4 = &routetable.DummyTable{}
 	}
 
 	epManager := newEndpointManager(
@@ -958,29 +1001,17 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		dp.filterTables = append(dp.filterTables, filterTableV6)
 
 		if config.RulesConfig.VXLANEnabledV6 {
-			var routeTableVXLANV6 routetable.RouteTableInterface
-			if !config.RouteSyncDisabled {
-				log.Debug("RouteSyncDisabled is false.")
-				routeTableVXLANV6 = routetable.New([]string{"^" + dataplanedefs.VXLANIfaceNameV6 + "$"}, 6, config.NetlinkTimeout,
-					config.DeviceRouteSourceAddressIPv6, config.DeviceRouteProtocol, true, unix.RT_TABLE_MAIN,
-					dp.loopSummarizer, featureDetector, routetable.WithLivenessCB(dp.reportHealth))
-			} else {
-				log.Debug("RouteSyncDisabled is true, using DummyTable for routeTableVXLANV6.")
-				routeTableVXLANV6 = &routetable.DummyTable{}
-			}
-
 			vxlanFDBV6 := vxlanfdb.New(netlink.FAMILY_V6, dataplanedefs.VXLANIfaceNameV6, featureDetector, config.NetlinkTimeout)
 			dp.vxlanFDBs = append(dp.vxlanFDBs, vxlanFDBV6)
 
 			dp.vxlanManagerV6 = newVXLANManager(
 				ipSetsV6,
-				routeTableVXLANV6,
+				routeTableV6,
 				vxlanFDBV6,
 				dataplanedefs.VXLANIfaceNameV6,
 				config,
 				dp.loopSummarizer,
 				6,
-				featureDetector,
 			)
 			dp.vxlanParentCV6 = make(chan string, 1)
 			go dp.vxlanManagerV6.KeepVXLANDeviceInSync(context.Background(), config.VXLANMTUV6, dataplaneFeatures.ChecksumOffloadBroken, 10*time.Second, dp.vxlanParentCV6)
@@ -988,19 +1019,6 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		} else {
 			// Start a cleanup goroutine not to block felix if it needs to retry
 			go cleanUpVXLANDevice(dataplanedefs.VXLANIfaceNameV6)
-		}
-
-		var routeTableV6 routetable.RouteTableInterface
-		if !config.RouteSyncDisabled {
-			log.Debug("RouteSyncDisabled is false.")
-			routeTableV6 = routetable.New(
-				interfaceRegexes, 6, config.NetlinkTimeout,
-				config.DeviceRouteSourceAddressIPv6, config.DeviceRouteProtocol, config.RemoveExternalRoutes,
-				unix.RT_TABLE_MAIN, dp.loopSummarizer, featureDetector, routetable.WithLivenessCB(dp.reportHealth),
-				routetable.WithRouteCleanupGracePeriod(routeCleanupGracePeriod))
-		} else {
-			log.Debug("RouteSyncDisabled is true, using DummyTable for routeTableV6.")
-			routeTableV6 = &routetable.DummyTable{}
 		}
 
 		ipsetsManagerV6.AddDataplane(ipSetsV6)
@@ -1096,9 +1114,16 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 // findHostMTU auto-detects the smallest host interface MTU.
 func findHostMTU(matchRegex *regexp.Regexp) (int, error) {
 	// Find all the interfaces on the host.
-	links, err := netlink.LinkList()
+
+	nlHandle, err := netlinkshim.NewRealNetlink()
 	if err != nil {
-		log.WithError(err).Error("Failed to list interfaces. Unable to auto-detect MTU")
+		log.WithError(err).Error("Failed to create netlink handle. Unable to auto-detect MTU.")
+		return 0, err
+	}
+
+	links, err := nlHandle.LinkList()
+	if err != nil {
+		log.WithError(err).Error("Failed to list interfaces. Unable to auto-detect MTU.")
 		return 0, err
 	}
 
@@ -1331,7 +1356,7 @@ type Manager interface {
 
 type ManagerWithRouteTables interface {
 	Manager
-	GetRouteTableSyncers() []routetable.RouteTableSyncer
+	GetRouteTableSyncers() []routetable.SyncerInterface
 }
 
 type ManagerWithRouteRules interface {
@@ -1346,12 +1371,11 @@ type routeRules interface {
 	Apply() error
 }
 
-func (d *InternalDataplane) routeTableSyncers() []routetable.RouteTableSyncer {
-	var rts []routetable.RouteTableSyncer
+func (d *InternalDataplane) routeTableSyncers() []routetable.SyncerInterface {
+	rts := d.mainRouteTables
 	for _, mrts := range d.managersWithRouteTables {
 		rts = append(rts, mrts.GetRouteTableSyncers()...)
 	}
-
 	return rts
 }
 
@@ -2089,9 +2113,12 @@ func (d *InternalDataplane) processIfaceStateUpdate(ifaceUpdate *ifaceStateUpdat
 		fdb.OnIfaceStateChanged(ifaceUpdate.Name, ifaceUpdate.State)
 	}
 
+	for _, rt := range d.mainRouteTables {
+		rt.OnIfaceStateChanged(ifaceUpdate.Name, ifaceUpdate.Index, ifaceUpdate.State)
+	}
 	for _, mgr := range d.managersWithRouteTables {
 		for _, routeTable := range mgr.GetRouteTableSyncers() {
-			routeTable.OnIfaceStateChanged(ifaceUpdate.Name, ifaceUpdate.State)
+			routeTable.OnIfaceStateChanged(ifaceUpdate.Name, ifaceUpdate.Index, ifaceUpdate.State)
 		}
 	}
 }
@@ -2128,18 +2155,22 @@ func (d *InternalDataplane) configureKernel() {
 	out, err := mp.Exec()
 	log.WithError(err).WithField("output", out).Infof("attempted to modprobe %s", moduleConntrackSCTP)
 
-	log.Info("Making sure IPv4 forwarding is enabled.")
-	err = writeProcSys("/proc/sys/net/ipv4/ip_forward", "1")
-	if err != nil {
-		log.WithError(err).Error("Failed to set IPv4 forwarding sysctl")
-	}
-
-	if d.config.IPv6Enabled {
-		log.Info("Making sure IPv6 forwarding is enabled.")
-		err = writeProcSys("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+	if d.config.IPForwarding == "Enabled" {
+		log.Info("Making sure IPv4 forwarding is enabled.")
+		err = writeProcSys("/proc/sys/net/ipv4/ip_forward", "1")
 		if err != nil {
-			log.WithError(err).Error("Failed to set IPv6 forwarding sysctl")
+			log.WithError(err).Error("Failed to set IPv4 forwarding sysctl")
 		}
+
+		if d.config.IPv6Enabled {
+			log.Info("Making sure IPv6 forwarding is enabled.")
+			err = writeProcSys("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+			if err != nil {
+				log.WithError(err).Error("Failed to set IPv6 forwarding sysctl")
+			}
+		}
+	} else {
+		log.Info("IPv4 forwarding disabled by config, leaving sysctls untouched.")
 	}
 
 	if d.config.BPFEnabled && d.config.BPFDisableUnprivileged {
@@ -2281,13 +2312,14 @@ func (d *InternalDataplane) apply() {
 	// Update the routing table in parallel with the other updates.  We'll wait for it to finish
 	// before we return.
 	var routesWG sync.WaitGroup
+	var numBackgroundProblems atomic.Uint64
 	for _, r := range d.routeTableSyncers() {
 		routesWG.Add(1)
-		go func(r routetable.RouteTableSyncer) {
+		go func(r routetable.SyncerInterface) {
 			err := r.Apply()
 			if err != nil {
 				log.Warn("Failed to synchronize routing table, will retry...")
-				d.dataplaneNeedsSync = true
+				numBackgroundProblems.Add(1)
 			}
 			d.reportHealth()
 			routesWG.Done()
@@ -2303,7 +2335,7 @@ func (d *InternalDataplane) apply() {
 			err := r.Apply()
 			if err != nil {
 				log.Warn("Failed to synchronize routing rules, will retry...")
-				d.dataplaneNeedsSync = true
+				numBackgroundProblems.Add(1)
 			}
 			d.reportHealth()
 			rulesWG.Done()
@@ -2358,6 +2390,10 @@ func (d *InternalDataplane) apply() {
 
 	// Wait for the rule updates to finish.
 	rulesWG.Wait()
+
+	if numBackgroundProblems.Load() > 0 {
+		d.dataplaneNeedsSync = true
+	}
 
 	// And publish and status updates.
 	d.endpointStatusCombiner.Apply()
@@ -2447,7 +2483,8 @@ func (d dummyLock) Lock() {
 func (d dummyLock) Unlock() {
 }
 
-func startBPFDataplaneComponents(ipFamily proto.IPVersion,
+func startBPFDataplaneComponents(
+	ipFamily proto.IPVersion,
 	bpfmaps *bpfmap.IPMaps,
 	ipSetIDAllocator *idalloc.IDAllocator,
 	config Config,

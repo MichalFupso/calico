@@ -16,8 +16,10 @@ package workload
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -26,20 +28,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-
-	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
 
 	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/tcpdump"
 	"github.com/projectcalico/calico/felix/fv/utils"
+	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 type Workload struct {
@@ -276,7 +277,7 @@ func (w *Workload) Start() error {
 				log.WithError(err).Info("End of workload stderr")
 				return
 			}
-			log.Infof("Workload %s stderr: %s", w.Name, strings.TrimSpace(string(line)))
+			_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "%v[stderr] %v", w.Name, line)
 		}
 	}()
 
@@ -294,6 +295,7 @@ func (w *Workload) Start() error {
 		defer errDone.Wait()
 		return fmt.Errorf("reading from stdout failed: %w", err)
 	}
+	log.WithField("workload", w.Name).Infof("Workload namespace path: %s", namespacePath)
 
 	w.namespacePath = strings.TrimSpace(namespacePath)
 
@@ -304,7 +306,7 @@ func (w *Workload) Start() error {
 				log.WithError(err).Info("End of workload stdout")
 				return
 			}
-			log.Infof("Workload %s stdout: %s", w.Name, strings.TrimSpace(string(line)))
+			_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "%v[stdout] %v", w.Name, line)
 		}
 	}()
 
@@ -598,7 +600,6 @@ func startSideService(w *Workload) (*SideService, error) {
 	}
 	testWorkloadShArgs = append(testWorkloadShArgs,
 		"--sidecar-iptables",
-		"--up-lo",
 		fmt.Sprintf("'--namespace-path=%s'", w.namespacePath),
 		"''", // interface name, not important
 		"127.0.0.1",
@@ -635,8 +636,10 @@ type PersistentConnectionOpts struct {
 	Timeout             time.Duration
 }
 
-func (w *Workload) StartPersistentConnection(ip string, port int,
-	opts PersistentConnectionOpts) *connectivity.PersistentConnection {
+func (w *Workload) StartPersistentConnection(
+	ip string, port int,
+	opts PersistentConnectionOpts,
+) *connectivity.PersistentConnection {
 
 	pc := &connectivity.PersistentConnection{
 		RuntimeName:         w.C.Name,
@@ -842,4 +845,31 @@ func (w *Workload) InterfaceIndex() int {
 	Expect(err).NotTo(HaveOccurred())
 	log.Infof("%v is ifindex %v", w.InterfaceName, ifIndex)
 	return ifIndex
+}
+
+func (w *Workload) RenameInterface(from, to string) {
+	var err error
+	sleep := 100 * time.Millisecond
+	for try := 0; try < 40; try++ {
+		// Can fail with EBUSY.
+		err = w.C.ExecMayFail("ip", "link", "set", from, "name", to)
+		if err == nil {
+			return
+		}
+		time.Sleep(sleep)
+		sleep = time.Duration(float64(sleep) * (1.5 + rand.Float64()))
+		const maxSleep = 2 * time.Second
+		if sleep > maxSleep {
+			sleep = maxSleep
+		}
+	}
+	ginkgo.Fail(fmt.Sprintf("Failed to rename interface %s to %s after several retries: %s", from, to, err))
+}
+
+func (w *Workload) SetInterfaceUp(b bool) {
+	if b {
+		w.C.Exec("ip", "link", "set", "up", w.InterfaceName)
+	} else {
+		w.C.Exec("ip", "link", "set", "down", w.InterfaceName)
+	}
 }

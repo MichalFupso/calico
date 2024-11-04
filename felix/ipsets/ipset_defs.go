@@ -22,10 +22,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
-
 	"github.com/projectcalico/calico/felix/ip"
 	"github.com/projectcalico/calico/felix/labelindex"
+	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 )
 
 var (
@@ -133,7 +132,7 @@ func (t IPSetType) IsMemberIPV6(member string) bool {
 
 		return cidr1
 	case IPSetTypeBitmapPort:
-		return strings.HasPrefix("v6,", member)
+		return strings.HasPrefix(member, "v6,")
 	}
 	log.WithField("type", string(t)).Panic("Unknown IPSetType")
 	return false
