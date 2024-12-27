@@ -57,6 +57,14 @@ func registerResourceInfo(kind string, plural string, typeOf reflect.Type) {
 	resourceInfoByPlural[plural] = ri
 }
 
+func AllResourcePlurals() []string {
+	plurals := make([]string, 0, len(resourceInfoByPlural))
+	for plural := range resourceInfoByPlural {
+		plurals = append(plurals, plural)
+	}
+	return plurals
+}
+
 func init() {
 	registerResourceInfo(
 		apiv3.KindBGPPeer,
@@ -96,6 +104,11 @@ func init() {
 	registerResourceInfo(
 		KindKubernetesAdminNetworkPolicy,
 		"kubernetesadminnetworkpolicies",
+		reflect.TypeOf(apiv3.GlobalNetworkPolicy{}),
+	)
+	registerResourceInfo(
+		KindKubernetesBaselineAdminNetworkPolicy,
+		"kubernetesbaselineadminnetworkpolicies",
 		reflect.TypeOf(apiv3.GlobalNetworkPolicy{}),
 	)
 	registerResourceInfo(

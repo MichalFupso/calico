@@ -194,7 +194,6 @@ define build_windows_binary
 endef
 
 # Images used in build / test across multiple directories.
-PROTOC_CONTAINER=calico/protoc:$(PROTOC_VER)-$(BUILDARCH)
 ETCD_IMAGE ?= quay.io/coreos/etcd:$(ETCD_VERSION)-$(ARCH)
 ifeq ($(BUILDARCH),amd64)
 	# *-amd64 tagged images for etcd are not available until v3.5.0
@@ -453,7 +452,6 @@ GIT_COMMIT_MESSAGE?="Automatic Pin Updates"
 GIT_PR_BRANCH_BASE?=$(SEMAPHORE_GIT_BRANCH)
 PIN_UPDATE_BRANCH?=semaphore-auto-pin-updates-$(GIT_PR_BRANCH_BASE)
 GIT_PR_BRANCH_HEAD?=$(PIN_UPDATE_BRANCH)
-GIT_REPO_SLUG?=$(SEMAPHORE_GIT_REPO_SLUG)
 GIT_PIN_UPDATE_COMMIT_FILES?=go.mod go.sum
 GIT_PIN_UPDATE_COMMIT_EXTRA_FILES?=$(GIT_COMMIT_EXTRA_FILES)
 GIT_COMMIT_FILES?=$(GIT_PIN_UPDATE_COMMIT_FILES) $(GIT_PIN_UPDATE_COMMIT_EXTRA_FILES)
@@ -563,7 +561,7 @@ trigger-auto-pin-update-process-wrapped: create-pin-update-head trigger-pin-upda
 .PHONY: static-checks
 ## Run static source code checks (lint, formatting, ...)
 static-checks: $(LOCAL_CHECKS)
-	$(MAKE) check-fmt golangci-lint
+	$(MAKE) golangci-lint
 
 LINT_ARGS ?= --max-issues-per-linter 0 --max-same-issues 0 --timeout 8m
 
@@ -571,13 +569,17 @@ LINT_ARGS ?= --max-issues-per-linter 0 --max-same-issues 0 --timeout 8m
 golangci-lint: $(GENERATED_FILES)
 	$(DOCKER_RUN) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) golangci-lint run $(LINT_ARGS)'
 
-.PHONY: go-fmt goimports fix
-fix go-fmt goimports:
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'find . -iname "*.go" ! -wholename "./vendor/*" | xargs goimports -w -local github.com/projectcalico/calico/'
+REPO_DIR=$(shell if [ -e hack/format-changed-files.sh ]; then echo '.'; else echo '..'; fi )
 
-check-fmt:
-	@echo "Checking code formatting.  Any listed files don't match goimports:"
-	$(DOCKER_RUN) $(CALICO_BUILD) bash -c 'exec 5>&1; ! [[ `find . -iname "*.go" ! -wholename "./vendor/*" | xargs goimports -l -local github.com/projectcalico/calico/ | tee >(cat >&5)` ]]'
+.PHONY: fix-changed go-fmt-changed goimports-changed
+# Format changed files only.
+fix-changed go-fmt-changed goimports-changed:
+	$(DOCKER_RUN) -e release_prefix=$(RELEASE_BRANCH_PREFIX)-v \
+	              -e git_repo_slug=$(GIT_REPO_SLUG) $(CALICO_BUILD) $(REPO_DIR)/hack/format-changed-files.sh
+
+.PHONY: fix-all go-fmt-all goimports-all
+fix-all go-fmt-all goimports-all:
+	$(DOCKER_RUN) $(CALICO_BUILD) $(REPO_DIR)/hack/format-all-files.sh
 
 .PHONY: pre-commit
 pre-commit:
@@ -1443,9 +1445,9 @@ DOCKER_CREDENTIAL_OS="linux"
 DOCKER_CREDENTIAL_ARCH="amd64"
 $(WINDOWS_DIST)/bin/docker-credential-gcr:
 	-mkdir -p $(WINDOWS_DIST)/bin
-	curl -fsSL "https://github.com/GoogleCloudPlatform/docker-credential-gcr/releases/download/v$(DOCKER_CREDENTIAL_VERSION)/docker-credential-gcr_$(DOCKER_CREDENTIAL_OS)_$(DOCKER_CREDENTIAL_ARCH)-$(DOCKER_CREDENTIAL_VERSION).tar.gz" \
-	| tar xz --to-stdout docker-credential-gcr \
-	| tee $(WINDOWS_DIST)/bin/docker-credential-gcr > /dev/null && chmod +x $(WINDOWS_DIST)/bin/docker-credential-gcr
+	curl -fsSL  --retry 5 "https://github.com/GoogleCloudPlatform/docker-credential-gcr/releases/download/v$(DOCKER_CREDENTIAL_VERSION)/docker-credential-gcr_$(DOCKER_CREDENTIAL_OS)_$(DOCKER_CREDENTIAL_ARCH)-$(DOCKER_CREDENTIAL_VERSION).tar.gz" -o docker-credential-gcr.tar.gz
+	tar xzf docker-credential-gcr.tar.gz --to-stdout docker-credential-gcr | tee $@ > /dev/null && chmod +x $@
+	rm -f docker-credential-gcr.tar.gz
 
 .PHONY: docker-credential-gcr-binary
 docker-credential-gcr-binary: var-require-all-WINDOWS_DIST-DOCKER_CREDENTIAL_VERSION-DOCKER_CREDENTIAL_OS-DOCKER_CREDENTIAL_ARCH $(WINDOWS_DIST)/bin/docker-credential-gcr

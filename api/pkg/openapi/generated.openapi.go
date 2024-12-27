@@ -83,6 +83,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.KubeControllersConfigurationList":   schema_pkg_apis_projectcalico_v3_KubeControllersConfigurationList(ref),
 		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.KubeControllersConfigurationSpec":   schema_pkg_apis_projectcalico_v3_KubeControllersConfigurationSpec(ref),
 		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.KubeControllersConfigurationStatus": schema_pkg_apis_projectcalico_v3_KubeControllersConfigurationStatus(ref),
+		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.LoadBalancerControllerConfig":       schema_pkg_apis_projectcalico_v3_LoadBalancerControllerConfig(ref),
 		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.NamespaceControllerConfig":          schema_pkg_apis_projectcalico_v3_NamespaceControllerConfig(ref),
 		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.NetworkPolicy":                      schema_pkg_apis_projectcalico_v3_NetworkPolicy(ref),
 		"github.com/projectcalico/api/pkg/apis/projectcalico/v3.NetworkPolicyList":                  schema_pkg_apis_projectcalico_v3_NetworkPolicyList(ref),
@@ -2041,11 +2042,17 @@ func schema_pkg_apis_projectcalico_v3_ControllersConfig(ref common.ReferenceCall
 							Ref:         ref("github.com/projectcalico/api/pkg/apis/projectcalico/v3.NamespaceControllerConfig"),
 						},
 					},
+					"loadBalancer": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LoadBalancer enables and configures the LoadBalancer controller. Enabled by default, set to nil to disable.",
+							Ref:         ref("github.com/projectcalico/api/pkg/apis/projectcalico/v3.LoadBalancerControllerConfig"),
+						},
+					},
 				},
 			},
 		},
 		Dependencies: []string{
-			"github.com/projectcalico/api/pkg/apis/projectcalico/v3.NamespaceControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.NodeControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.PolicyControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.ServiceAccountControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.WorkloadEndpointControllerConfig"},
+			"github.com/projectcalico/api/pkg/apis/projectcalico/v3.LoadBalancerControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.NamespaceControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.NodeControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.PolicyControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.ServiceAccountControllerConfig", "github.com/projectcalico/api/pkg/apis/projectcalico/v3.WorkloadEndpointControllerConfig"},
 	}
 }
 
@@ -2965,6 +2972,20 @@ func schema_pkg_apis_projectcalico_v3_FelixConfigurationSpec(ref common.Referenc
 							Format:      "",
 						},
 					},
+					"bpfConntrackLogLevel": {
+						SchemaProps: spec.SchemaProps{
+							Description: "BPFConntrackLogLevel controls the log level of the BPF conntrack cleanup program, which runs periodically to clean up expired BPF conntrack entries. [Default: Off].",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"bpfConntrackMode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "BPFConntrackCleanupMode controls how BPF conntrack entries are cleaned up.  `Auto` will use a BPF program if supported, falling back to userspace if not.  `Userspace` will always use the userspace cleanup code.  `BPFProgram` will always use the BPF program (failing if not supported). [Default: Auto]",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"bpfLogFilters": {
 						SchemaProps: spec.SchemaProps{
 							Description: "BPFLogFilters is a map of key=values where the value is a pcap filter expression and the key is an interface name with 'all' denoting all interfaces, 'weps' all workload endpoints and 'heps' all host endpoints.\n\nWhen specified as an env var, it accepts a comma-separated list of key=values. [Default: unset - means all debug logs are emitted]",
@@ -2990,7 +3011,7 @@ func schema_pkg_apis_projectcalico_v3_FelixConfigurationSpec(ref common.Referenc
 					},
 					"bpfDataIfacePattern": {
 						SchemaProps: spec.SchemaProps{
-							Description: "BPFDataIfacePattern is a regular expression that controls which interfaces Felix should attach BPF programs to in order to catch traffic to/from the network.  This needs to match the interfaces that Calico workload traffic flows over as well as any interfaces that handle incoming traffic to nodeports and services from outside the cluster.  It should not match the workload interfaces (usually named cali...).",
+							Description: "BPFDataIfacePattern is a regular expression that controls which interfaces Felix should attach BPF programs to in order to catch traffic to/from the network.  This needs to match the interfaces that Calico workload traffic flows over as well as any interfaces that handle incoming traffic to nodeports and services from outside the cluster.  It should not match the workload interfaces (usually named cali...) or any other special device managed by Calico itself (e.g., tunnels).",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -3113,6 +3134,13 @@ func schema_pkg_apis_projectcalico_v3_FelixConfigurationSpec(ref common.Referenc
 							Format:      "int32",
 						},
 					},
+					"bpfMapSizeConntrackCleanupQueue": {
+						SchemaProps: spec.SchemaProps{
+							Description: "BPFMapSizeConntrackCleanupQueue sets the size for the map used to hold NAT conntrack entries that are queued for cleanup.  This should be big enough to hold all the NAT entries that expire within one cleanup interval.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
 					"bpfMapSizeIPSets": {
 						SchemaProps: spec.SchemaProps{
 							Description: "BPFMapSizeIPSets sets the size for ipsets map.  The IP sets map must be large enough to hold an entry for each endpoint matched by every selector in the source/destination matches in network policy.  Selectors such as \"all()\" can result in large numbers of entries (one entry per endpoint in that case).",
@@ -3188,6 +3216,13 @@ func schema_pkg_apis_projectcalico_v3_FelixConfigurationSpec(ref common.Referenc
 					"bpfRedirectToPeer": {
 						SchemaProps: spec.SchemaProps{
 							Description: "BPFRedirectToPeer controls which whether it is allowed to forward straight to the peer side of the workload devices. It is allowed for any host L2 devices by default (L2Only), but it breaks TCP dump on the host side of workload device as it bypasses it on ingress. Value of Enabled also allows redirection from L3 host devices like IPIP tunnel or Wireguard directly to the peer side of the workload's device. This makes redirection faster, however, it breaks tools like tcpdump on the peer side. Use Enabled with caution. [Default: L2Only]",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"bpfProfiling": {
+						SchemaProps: spec.SchemaProps{
+							Description: "BPFProfiling controls profiling of BPF programs. At the monent, it can be Disabled or Enabled. [Default: Disabled]",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -4325,6 +4360,13 @@ func schema_pkg_apis_projectcalico_v3_IPPoolSpec(ref common.ReferenceCallback) c
 							},
 						},
 					},
+					"assignmentMode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Determines the mode how IP addresses should be assigned from this pool",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
 				Required: []string{"cidr"},
 			},
@@ -4639,6 +4681,24 @@ func schema_pkg_apis_projectcalico_v3_KubeControllersConfigurationStatus(ref com
 		},
 		Dependencies: []string{
 			"github.com/projectcalico/api/pkg/apis/projectcalico/v3.KubeControllersConfigurationSpec"},
+	}
+}
+
+func schema_pkg_apis_projectcalico_v3_LoadBalancerControllerConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"assignIPs": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+				},
+			},
+		},
 	}
 }
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -178,9 +178,11 @@ type Config struct {
 	BPFEnabled                         bool              `config:"bool;false"`
 	BPFDisableUnprivileged             bool              `config:"bool;true"`
 	BPFLogLevel                        string            `config:"oneof(off,info,debug);off;non-zero"`
+	BPFConntrackLogLevel               string            `config:"oneof(off,debug);off;non-zero"`
+	BPFConntrackCleanupMode            string            `config:"oneof(Auto,Userspace,BPFProgram);Auto"`
 	BPFLogFilters                      map[string]string `config:"keyvaluelist;;"`
 	BPFCTLBLogFilter                   string            `config:"oneof(all);;"`
-	BPFDataIfacePattern                *regexp.Regexp    `config:"regexp;^((en|wl|ww|sl|ib)[Popsx].*|(eth|wlan|wwan|bond).*|tunl0$|vxlan.calico$|vxlan-v6.calico$|wireguard.cali$|wg-v6.cali$|egress.calico$)"`
+	BPFDataIfacePattern                *regexp.Regexp    `config:"regexp;^((en|wl|ww|sl|ib)[Popsx].*|(eth|wlan|wwan|bond).*)"`
 	BPFL3IfacePattern                  *regexp.Regexp    `config:"regexp;"`
 	BPFConnectTimeLoadBalancingEnabled bool              `config:"bool;;"`
 	BPFConnectTimeLoadBalancing        string            `config:"oneof(TCP,Enabled,Disabled);TCP;non-zero"`
@@ -197,6 +199,7 @@ type Config struct {
 	BPFMapSizeNATAffinity              int               `config:"int;65536;non-zero"`
 	BPFMapSizeRoute                    int               `config:"int;262144;non-zero"`
 	BPFMapSizeConntrack                int               `config:"int;512000;non-zero"`
+	BPFMapSizeConntrackCleanupQueue    int               `config:"int;100000;non-zero"`
 	BPFMapSizeIPSets                   int               `config:"int;1048576;non-zero"`
 	BPFMapSizeIfState                  int               `config:"int;1000;non-zero"`
 	BPFHostConntrackBypass             bool              `config:"bool;false"`
@@ -206,6 +209,7 @@ type Config struct {
 	BPFDisableGROForIfaces             *regexp.Regexp    `config:"regexp;"`
 	BPFExcludeCIDRsFromNAT             []string          `config:"cidr-list;;"`
 	BPFRedirectToPeer                  string            `config:"oneof(Disabled,Enabled,L2Only);L2Only;non-zero"`
+	BPFProfiling                       string            `config:"oneof(Disabled,Enabled);Disabled;non-zero"`
 
 	// DebugBPFCgroupV2 controls the cgroup v2 path that we apply the connect-time load balancer to.  Most distros
 	// are configured for cgroup v1, which prevents all but the root cgroup v2 from working so this is only useful

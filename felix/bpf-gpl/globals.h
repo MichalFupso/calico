@@ -19,7 +19,7 @@ struct name {				\
 	ip_t host_tunnel_ip;		\
 	__be32 flags;			\
 	__be16 wg_port;			\
-	__be16 __pad;			\
+	__be16 profiling;		\
 	__u32 natin_idx;		\
 	__u32 natout_idx;		\
 	__u8 iface_name[16];		\
@@ -69,6 +69,21 @@ struct cali_xdp_globals {
 struct cali_xdp_preamble_globals {
 	struct cali_xdp_globals v4;
 	struct cali_xdp_globals v6;
+};
+
+struct cali_ct_cleanup_globals {
+    __u64 creation_grace;
+
+    __u64 tcp_pre_established;
+    __u64 tcp_established;
+    __u64 tcp_fins_seen;
+    __u64 tcp_reset_seen;
+
+    __u64 udp_last_seen;
+
+    __u64 generic_last_seen;
+
+    __u64 icmp_last_seen;
 };
 
 #endif /* __CALI_GLOBALS_H__ */
