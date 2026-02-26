@@ -121,6 +121,10 @@ require (
 )
 
 require (
+	github.com/j-keck/arping v1.0.3 // indirect
+	golang.org/x/crypto v0.47.0 // indirect
+)
+require (
 	github.com/docker/distribution v2.8.3+incompatible // indirect
 	github.com/docker/docker v28.5.1+incompatible // indirect
 	github.com/go-kit/log v0.2.1 // indirect

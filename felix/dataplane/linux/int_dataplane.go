@@ -519,6 +519,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 	dp.RegisterManager(dp.liveMigrationMonitor)
 	dp.ifaceMonitor.StateCallback = dp.onIfaceStateChange
 	dp.ifaceMonitor.AddrCallback = dp.onIfaceAddrsChange
+	dp.ifaceMonitor.AddrCIDRCallback = dp.onIfaceAddrsCIDRChange
 	dp.ifaceMonitor.InSyncCallback = dp.onIfaceInSync
 
 	backendMode := environment.DetectBackend(config.LookPathOverride, cmdshim.NewRealCmd, config.IptablesBackend)
@@ -738,6 +739,11 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			dp.RegisterManager(dp.noEncapManagerV6)
 		}
 	}
+
+	// Register the proxy ARP manager. It auto-detects when local pods have IPs in the
+	// same subnet as a host physical interface and enables proxy ARP on that interface.
+	// This is registered unconditionally since the detection is dynamic.
+	dp.RegisterManager(newProxyARPManager(config, 4))
 
 	dataplaneFeatures := featureDetector.GetFeatures()
 
@@ -1908,6 +1914,24 @@ func NewIfaceAddrsUpdate(name string, ips ...string) any {
 	}
 }
 
+type ifaceAddrsCIDRUpdate struct {
+	Name      string
+	AddrCIDRs set.Set[string]
+}
+
+// onIfaceAddrsCIDRChange is our interface address CIDR monitor callback.  It gets called
+// from the monitor's thread and preserves the subnet prefix length (e.g., "10.0.0.5/24").
+func (d *InternalDataplane) onIfaceAddrsCIDRChange(ifaceName string, addrCIDRs set.Set[string]) {
+	log.WithFields(log.Fields{
+		"ifaceName": ifaceName,
+		"addrCIDRs": addrCIDRs,
+	}).Debug("Linux interface addr CIDRs changed.")
+	d.ifaceUpdates <- &ifaceAddrsCIDRUpdate{
+		Name:      ifaceName,
+		AddrCIDRs: addrCIDRs,
+	}
+}
+
 func (d *InternalDataplane) SendMessage(msg any) error {
 	d.toDataplane <- msg
 	return nil
@@ -2537,6 +2561,8 @@ func (d *InternalDataplane) processIfaceUpdate(ifaceUpdate any) {
 		d.processIfaceStateUpdate(ifaceUpdateMsg)
 	case *ifaceAddrsUpdate:
 		d.processIfaceAddrsUpdate(ifaceUpdateMsg)
+	case *ifaceAddrsCIDRUpdate:
+		d.processIfaceAddrsCIDRUpdate(ifaceUpdateMsg)
 	case *ifaceInSync:
 		d.processIfaceInSync()
 	}
@@ -2584,6 +2610,14 @@ func (d *InternalDataplane) processIfaceAddrsUpdate(ifaceAddrsUpdate *ifaceAddrs
 	d.addrsUpdateBatchSize++
 	for _, mgr := range d.allManagers {
 		mgr.OnUpdate(ifaceAddrsUpdate)
+	}
+}
+
+func (d *InternalDataplane) processIfaceAddrsCIDRUpdate(update *ifaceAddrsCIDRUpdate) {
+	log.WithField("msg", update).Debug("Received interface address CIDR update")
+	d.dataplaneNeedsSync = true
+	for _, mgr := range d.allManagers {
+		mgr.OnUpdate(update)
 	}
 }
 

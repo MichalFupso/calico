@@ -49,6 +49,7 @@ const (
 
 type InterfaceStateCallback func(ifaceName string, ifaceState State, ifIndex int)
 type AddrStateCallback func(ifaceName string, addrs set.Set[string])
+type AddrCIDRStateCallback func(ifaceName string, addrCIDRs set.Set[string])
 type InSyncCallback func()
 
 type Config struct {
@@ -70,6 +71,7 @@ type InterfaceMonitor struct {
 
 	StateCallback    InterfaceStateCallback
 	AddrCallback     AddrStateCallback
+	AddrCIDRCallback AddrCIDRStateCallback
 	InSyncCallback   InSyncCallback
 	fatalErrCallback func(error)
 }
@@ -80,6 +82,7 @@ type ifaceInfo struct {
 	State      State
 	TrackAddrs bool
 	Addrs      set.Set[string]
+	AddrCIDRs  set.Set[string]
 }
 
 func New(config Config,
@@ -232,6 +235,7 @@ func (m *InterfaceMonitor) handleNetlinkRouteUpdate(update netlink.RouteUpdate) 
 	}
 
 	addr := update.Dst.IP.String()
+	addrCIDR := update.Dst.String()
 	exists := update.Type == unix.RTM_NEWROUTE
 	logCtx := log.WithFields(log.Fields{
 		"addr":    addr,
@@ -249,11 +253,13 @@ func (m *InterfaceMonitor) handleNetlinkRouteUpdate(update netlink.RouteUpdate) 
 	if exists {
 		if !info.Addrs.Contains(addr) {
 			info.Addrs.Add(addr)
+			info.AddrCIDRs.Add(addrCIDR)
 			m.notifyIfaceAddrs(info)
 		}
 	} else {
 		if info.Addrs.Contains(addr) {
 			info.Addrs.Discard(addr)
+			info.AddrCIDRs.Discard(addrCIDR)
 			m.notifyIfaceAddrs(info)
 		}
 	}
@@ -270,6 +276,7 @@ func (m *InterfaceMonitor) notifyIfaceAddrs(info *ifaceInfo) {
 	}
 	logCtx.Debug("Notifying addresses for interface")
 	m.AddrCallback(info.Name, info.Addrs.Copy())
+	m.AddrCIDRCallback(info.Name, info.AddrCIDRs.Copy())
 }
 
 func (m *InterfaceMonitor) storeAndNotifyLink(ifaceExists bool, link netlink.Link) {
@@ -339,6 +346,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 				Name:       ifaceName,
 				TrackAddrs: trackAddrs,
 				Addrs:      set.New[string](),
+				AddrCIDRs:  set.New[string](),
 			}
 		}
 		m.ifaceNameToIdx[ifaceName] = ifIndex
@@ -370,6 +378,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 			// We were tracking addresses for this interface before but now it's gone.  Signal that.
 			log.Debug("Notify link non-existence to address callback consumers")
 			m.AddrCallback(ifaceName, nil)
+			m.AddrCIDRCallback(ifaceName, nil)
 		}
 		return
 	}
@@ -380,6 +389,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 	// will allow us to secure a Host Endpoint interface _before_ it comes up, and so eliminate
 	// a small window of insecurity.
 	newAddrs := set.New[string]()
+	newAddrCIDRs := set.New[string]()
 	for _, family := range [2]int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		routes, err := m.netlinkStub.ListLocalRoutes(link, family)
 		if err != nil {
@@ -395,6 +405,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 				continue
 			}
 			newAddrs.Add(route.Dst.IP.String())
+			newAddrCIDRs.Add(route.Dst.String())
 		}
 	}
 	info := m.ifaceIdxToInfo[ifIndex]
@@ -404,6 +415,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 			"new": newAddrs,
 		}).Debug("Detected interface address change while notifying link")
 		info.Addrs = newAddrs
+		info.AddrCIDRs = newAddrCIDRs
 
 		m.notifyIfaceAddrs(info)
 	}
@@ -450,6 +462,7 @@ func (m *InterfaceMonitor) resync() error {
 		if info.TrackAddrs {
 			// We were tracking addresses for this interface before but now it's gone.  Signal that.
 			m.AddrCallback(name, nil)
+			m.AddrCIDRCallback(name, nil)
 		}
 		delete(m.ifaceNameToIdx, name)
 		delete(m.ifaceIdxToInfo, ifIndex)
