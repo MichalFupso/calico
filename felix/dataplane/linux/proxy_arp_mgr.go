@@ -16,11 +16,14 @@ package intdataplane
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"net/netip"
 	"regexp"
 	"strings"
 
 	"github.com/j-keck/arping"
+	"github.com/mdlayher/ndp"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -37,30 +40,21 @@ type proxyARPEntry struct {
 	podIP     string
 }
 
-// poolInfo tracks IPAM pool metadata needed for proxy ARP decisions.
-type poolInfo struct {
-	cidr    net.IPNet
-	noEncap bool
-}
-
 // proxyARPManager automatically adds per-IP proxy ARP neighbor entries on host physical
-// interfaces when local pods have IPs from a NO_ENCAP pool that fall within the same L2
-// subnet as the host interface. This allows pods to be directly reachable on the physical
-// network without BGP, while only responding to ARP for specific pod IPs rather than
-// enabling blanket proxy ARP on the interface.
+// interfaces when local pods have IPs that fall within the same L2 subnet as the host
+// interface. This allows pods to be directly reachable on the physical network without
+// BGP or overlay encapsulation, while only responding to ARP for specific pod IPs rather
+// than enabling blanket proxy ARP on the interface.
 //
-// The manager uses WorkloadEndpointUpdate messages to learn pod IPs and IPAMPoolUpdate
-// messages to determine pool encapsulation mode, rather than RouteUpdate messages which
-// require IPAM block data that may not be available in Typha+KDD deployments.
+// The manager uses WorkloadEndpointUpdate messages to learn pod IPs. The subnet overlap
+// between pod IPs and host interface CIDRs is the sole criterion for programming proxy
+// ARP entries — no IPAM pool encapsulation mode check is required.
 type proxyARPManager struct {
 	ipVersion      uint8
 	wlIfacesRegexp *regexp.Regexp
 
 	// hostIfaceToCIDRs maps host interface name to the parsed CIDRs on that interface.
 	hostIfaceToCIDRs map[string][]net.IPNet
-
-	// ipamPools maps pool ID to pool info (CIDR and encap mode).
-	ipamPools map[string]*poolInfo
 
 	// localWorkloadIPs maps workload endpoint key to the pod's IP strings.
 	// Key is "orchestratorID/workloadID/endpointID".
@@ -85,15 +79,18 @@ type garpRequest struct {
 
 type garpSenderFunc func(ifaceName string, podIP net.IP) error
 
-// proxyNeighFunc abstracts netlink neighbor add/del for testability.
-type proxyNeighFunc func(neigh *netlink.Neigh) error
-
 func newProxyARPManager(
 	dpConfig Config,
 	ipVersion uint8,
 ) *proxyARPManager {
 	nl, _ := netlinkshim.NewRealNetlink()
-	return newProxyARPManagerWithShims(dpConfig, ipVersion, nl, sendGratuitousARP)
+	var sender garpSenderFunc
+	if ipVersion == 6 {
+		sender = sendUnsolicitedNA
+	} else {
+		sender = sendGratuitousARP
+	}
+	return newProxyARPManagerWithShims(dpConfig, ipVersion, nl, sender)
 }
 
 func newProxyARPManagerWithShims(
@@ -110,7 +107,6 @@ func newProxyARPManagerWithShims(
 		ipVersion:          ipVersion,
 		wlIfacesRegexp:     wlIfacesRegexp,
 		hostIfaceToCIDRs:   make(map[string][]net.IPNet),
-		ipamPools:          make(map[string]*poolInfo),
 		localWorkloadIPs:   make(map[string][]string),
 		activeProxyEntries: make(map[proxyARPEntry]bool),
 		nlHandle:           nl,
@@ -134,37 +130,6 @@ func (m *proxyARPManager) OnUpdate(protoBufMsg any) {
 		}).Debug("Proxy ARP manager received ifaceAddrsCIDRUpdate")
 		m.updateHostIfaceCIDRs(msg.Name, msg.AddrCIDRs)
 		m.dirty = true
-
-	case *proto.IPAMPoolUpdate:
-		pool := msg.GetPool()
-		if pool == nil {
-			return
-		}
-		_, cidr, err := net.ParseCIDR(pool.Cidr)
-		if err != nil {
-			return
-		}
-		isV6 := cidr.IP.To4() == nil
-		if (m.ipVersion == 6) != isV6 {
-			return
-		}
-		noEncap := pool.IpipMode == "" && pool.VxlanMode == ""
-		log.WithFields(log.Fields{
-			"poolID":    msg.Id,
-			"cidr":      pool.Cidr,
-			"ipipMode":  pool.IpipMode,
-			"vxlanMode": pool.VxlanMode,
-			"noEncap":   noEncap,
-		}).Debug("Proxy ARP manager received IPAMPoolUpdate")
-		m.ipamPools[msg.Id] = &poolInfo{cidr: *cidr, noEncap: noEncap}
-		m.dirty = true
-
-	case *proto.IPAMPoolRemove:
-		if _, ok := m.ipamPools[msg.Id]; ok {
-			log.WithField("poolID", msg.Id).Debug("Proxy ARP manager received IPAMPoolRemove")
-			delete(m.ipamPools, msg.Id)
-			m.dirty = true
-		}
 
 	case *proto.WorkloadEndpointUpdate:
 		ep := msg.GetEndpoint()
@@ -210,7 +175,6 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 
 	log.WithFields(log.Fields{
 		"numWorkloads":  len(m.localWorkloadIPs),
-		"numPools":      len(m.ipamPools),
 		"numHostIfaces": len(m.hostIfaceToCIDRs),
 	}).Debug("Proxy ARP manager CompleteDeferredWork")
 
@@ -221,9 +185,6 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 		for _, ipNet := range ipNets {
 			podIP := parsePodIP(ipNet)
 			if podIP == nil {
-				continue
-			}
-			if !m.isInNoEncapPool(podIP) {
 				continue
 			}
 			for ifaceName, cidrs := range m.hostIfaceToCIDRs {
@@ -264,16 +225,6 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 
 	m.activeProxyEntries = desired
 	return nil
-}
-
-// isInNoEncapPool returns true if the given IP falls within any tracked NO_ENCAP pool.
-func (m *proxyARPManager) isInNoEncapPool(podIP net.IP) bool {
-	for _, pool := range m.ipamPools {
-		if pool.noEncap && pool.cidr.Contains(podIP) {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *proxyARPManager) updateHostIfaceCIDRs(ifaceName string, addrCIDRs set.Set[string]) {
@@ -339,8 +290,13 @@ func (m *proxyARPManager) addProxyARPEntry(entry proxyARPEntry) {
 		return
 	}
 
+	family := unix.AF_INET
+	if m.ipVersion == 6 {
+		family = unix.AF_INET6
+	}
+
 	neigh := &netlink.Neigh{
-		Family:    unix.AF_INET,
+		Family:    family,
 		LinkIndex: link.Attrs().Index,
 		Flags:     netlink.NTF_PROXY,
 		IP:        net.ParseIP(entry.podIP),
@@ -366,8 +322,13 @@ func (m *proxyARPManager) removeProxyARPEntry(entry proxyARPEntry) {
 		return
 	}
 
+	family := unix.AF_INET
+	if m.ipVersion == 6 {
+		family = unix.AF_INET6
+	}
+
 	neigh := &netlink.Neigh{
-		Family:    unix.AF_INET,
+		Family:    family,
 		LinkIndex: link.Attrs().Index,
 		Flags:     netlink.NTF_PROXY,
 		IP:        net.ParseIP(entry.podIP),
@@ -414,4 +375,45 @@ func parsePodIP(cidrStr string) net.IP {
 // address. This updates ARP caches on all hosts in the L2 domain.
 func sendGratuitousARP(ifaceName string, podIP net.IP) error {
 	return arping.GratuitousArpOverIfaceByName(podIP, ifaceName)
+}
+
+// sendUnsolicitedNA sends an unsolicited Neighbor Advertisement for the given IPv6 address
+// on the given interface. This is the IPv6 equivalent of a gratuitous ARP: an NA with
+// Solicited=false and Override=true, sent to the all-nodes multicast address ff02::1.
+// It updates neighbor caches on all IPv6 hosts in the L2 domain.
+func sendUnsolicitedNA(ifaceName string, podIP net.IP) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return err
+	}
+
+	addr, ok := netip.AddrFromSlice(podIP)
+	if !ok {
+		return fmt.Errorf("invalid IP address: %s", podIP)
+	}
+
+	conn, _, err := ndp.Listen(iface, ndp.LinkLocal)
+	if err != nil {
+		return fmt.Errorf("failed to create NDP connection on %s: %w", ifaceName, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	na := &ndp.NeighborAdvertisement{
+		Override:      true,
+		TargetAddress: addr,
+		Options: []ndp.Option{
+			&ndp.LinkLayerAddress{
+				Direction: ndp.Target,
+				Addr:      iface.HardwareAddr,
+			},
+		},
+	}
+
+	// ff02::1 is the all-nodes link-local multicast address. All IPv6 hosts on
+	// the L2 segment receive this, analogous to broadcast in IPv4 gratuitous ARP.
+	allNodesMulticast := netip.MustParseAddr("ff02::1")
+	if err := conn.WriteTo(na, nil, allNodesMulticast); err != nil {
+		return fmt.Errorf("failed to send unsolicited NA for %s on %s: %w", podIP, ifaceName, err)
+	}
+	return nil
 }

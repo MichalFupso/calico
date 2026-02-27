@@ -740,10 +740,14 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		}
 	}
 
-	// Register the proxy ARP manager. It auto-detects when local pods have IPs in the
-	// same subnet as a host physical interface and enables proxy ARP on that interface.
-	// This is registered unconditionally since the detection is dynamic.
+	// Register the proxy ARP/NDP managers. They auto-detect when local pods have IPs in
+	// the same subnet as a host physical interface and add per-IP proxy ARP (IPv4) or
+	// proxy NDP (IPv6) entries on that interface. Registered unconditionally since
+	// the detection is dynamic.
 	dp.RegisterManager(newProxyARPManager(config, 4))
+	if config.IPv6Enabled {
+		dp.RegisterManager(newProxyARPManager(config, 6))
+	}
 
 	dataplaneFeatures := featureDetector.GetFeatures()
 

@@ -190,40 +190,6 @@ func newTestProxyARPManager(nl *mockNetlinkForProxyARP, garpSender *mockGARPSend
 	return newProxyARPManagerWithShims(config, 4, nl, garpSender.send)
 }
 
-// Helper to create an IPAMPoolUpdate for a NO_ENCAP pool (both modes empty/"Never").
-func noEncapPool(id, cidr string) *proto.IPAMPoolUpdate {
-	return &proto.IPAMPoolUpdate{
-		Id: id,
-		Pool: &proto.IPAMPool{
-			Cidr:      cidr,
-			IpipMode:  "",
-			VxlanMode: "",
-		},
-	}
-}
-
-// Helper to create an IPAMPoolUpdate for a VXLAN pool.
-func vxlanPool(id, cidr string) *proto.IPAMPoolUpdate {
-	return &proto.IPAMPoolUpdate{
-		Id: id,
-		Pool: &proto.IPAMPool{
-			Cidr:      cidr,
-			VxlanMode: "always",
-		},
-	}
-}
-
-// Helper to create an IPAMPoolUpdate for an IPIP pool.
-func ipipPool(id, cidr string) *proto.IPAMPoolUpdate {
-	return &proto.IPAMPoolUpdate{
-		Id: id,
-		Pool: &proto.IPAMPool{
-			Cidr:     cidr,
-			IpipMode: "always",
-		},
-	}
-}
-
 // Helper to create a WorkloadEndpointUpdate.
 func wepUpdate(orchID, wlID, epID string, ipv4Nets ...string) *proto.WorkloadEndpointUpdate {
 	return &proto.WorkloadEndpointUpdate{
@@ -277,7 +243,6 @@ var _ = Describe("Proxy ARP manager", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -299,7 +264,6 @@ var _ = Describe("Proxy ARP manager", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -320,7 +284,6 @@ var _ = Describe("Proxy ARP manager", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod2", "eth0", "10.0.0.51/32"))
 			err := mgr.CompleteDeferredWork()
@@ -368,7 +331,6 @@ var _ = Describe("Proxy ARP manager", func() {
 			nl.setIfaceAddr("eth1", "192.168.1.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
 			sendIfaceCIDRUpdate(mgr, "eth1", "192.168.1.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			// Pod in eth0's subnet only.
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
@@ -386,38 +348,7 @@ var _ = Describe("Proxy ARP manager", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "192.168.1.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "192.168.1.50/32"))
-			err := mgr.CompleteDeferredWork()
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("should not add any proxy ARP entries", func() {
-			Expect(nl.getEntries()).To(BeEmpty())
-		})
-	})
-
-	Describe("VXLAN pool ignored", func() {
-		BeforeEach(func() {
-			nl.setIfaceAddr("eth0", "10.0.0.1/24")
-			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(vxlanPool("pool-1", "10.0.0.0/24"))
-			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
-			err := mgr.CompleteDeferredWork()
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("should not add any proxy ARP entries", func() {
-			Expect(nl.getEntries()).To(BeEmpty())
-		})
-	})
-
-	Describe("IPIP pool ignored", func() {
-		BeforeEach(func() {
-			nl.setIfaceAddr("eth0", "10.0.0.1/24")
-			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(ipipPool("pool-1", "10.0.0.0/24"))
-			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
 		})
@@ -430,7 +361,6 @@ var _ = Describe("Proxy ARP manager", func() {
 	Describe("workload interface filtered", func() {
 		BeforeEach(func() {
 			sendIfaceCIDRUpdate(mgr, "cali12345", "10.0.0.50/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -443,7 +373,6 @@ var _ = Describe("Proxy ARP manager", func() {
 
 	Describe("race: workload arrives before interface CIDR", func() {
 		BeforeEach(func() {
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -472,7 +401,6 @@ var _ = Describe("Proxy ARP manager", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
 		})
@@ -499,7 +427,6 @@ var _ = Describe("Proxy ARP manager", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -522,53 +449,10 @@ var _ = Describe("Proxy ARP manager", func() {
 		})
 	})
 
-	Describe("pool type change from NO_ENCAP to VXLAN", func() {
-		BeforeEach(func() {
-			nl.setIfaceAddr("eth0", "10.0.0.1/24")
-			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
-			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
-			err := mgr.CompleteDeferredWork()
-			Expect(err).ToNot(HaveOccurred())
-			Expect(nl.getEntries()).To(HaveLen(1))
-
-			// Pool changes to VXLAN.
-			mgr.OnUpdate(vxlanPool("pool-1", "10.0.0.0/24"))
-			err = mgr.CompleteDeferredWork()
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("should remove the proxy ARP entry", func() {
-			Expect(nl.getEntries()).To(BeEmpty())
-		})
-	})
-
-	Describe("pool removed", func() {
-		BeforeEach(func() {
-			nl.setIfaceAddr("eth0", "10.0.0.1/24")
-			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
-			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
-			err := mgr.CompleteDeferredWork()
-			Expect(err).ToNot(HaveOccurred())
-			Expect(nl.getEntries()).To(HaveLen(1))
-
-			// Pool removed.
-			mgr.OnUpdate(&proto.IPAMPoolRemove{Id: "pool-1"})
-			err = mgr.CompleteDeferredWork()
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("should remove the proxy ARP entry", func() {
-			Expect(nl.getEntries()).To(BeEmpty())
-		})
-	})
-
 	Describe("interface removed", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
 			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
-			mgr.OnUpdate(noEncapPool("pool-1", "10.0.0.0/24"))
 			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -588,12 +472,6 @@ var _ = Describe("Proxy ARP manager", func() {
 	Describe("IPv6 addresses filtered in IPv4 manager", func() {
 		BeforeEach(func() {
 			sendIfaceCIDRUpdate(mgr, "eth0", "fd00::1/64")
-			mgr.OnUpdate(&proto.IPAMPoolUpdate{
-				Id: "pool-v6",
-				Pool: &proto.IPAMPool{
-					Cidr: "fd00::/64",
-				},
-			})
 			mgr.OnUpdate(&proto.WorkloadEndpointUpdate{
 				Id: &proto.WorkloadEndpointID{
 					OrchestratorId: "k8s",
@@ -612,4 +490,118 @@ var _ = Describe("Proxy ARP manager", func() {
 			Expect(nl.getEntries()).To(BeEmpty())
 		})
 	})
+})
+
+func newTestProxyNDPManager(nl *mockNetlinkForProxyARP, unaSender *mockGARPSender) *proxyARPManager {
+	config := Config{
+		RulesConfig: rules.Config{
+			WorkloadIfacePrefixes: []string{"cali"},
+		},
+	}
+	return newProxyARPManagerWithShims(config, 6, nl, unaSender.send)
+}
+
+// Helper to create a WorkloadEndpointUpdate with IPv6 nets.
+func wepUpdateV6(orchID, wlID, epID string, ipv6Nets ...string) *proto.WorkloadEndpointUpdate {
+	return &proto.WorkloadEndpointUpdate{
+		Id: &proto.WorkloadEndpointID{
+			OrchestratorId: orchID,
+			WorkloadId:     wlID,
+			EndpointId:     epID,
+		},
+		Endpoint: &proto.WorkloadEndpoint{
+			Ipv6Nets: ipv6Nets,
+		},
+	}
+}
+
+var _ = Describe("Proxy NDP manager (IPv6)", func() {
+	var (
+		mgr       *proxyARPManager
+		nl        *mockNetlinkForProxyARP
+		unaSender *mockGARPSender
+	)
+
+	BeforeEach(func() {
+		nl = newMockNetlinkForProxyARP()
+		unaSender = newMockGARPSender()
+		mgr = newTestProxyNDPManager(nl, unaSender)
+	})
+
+	AfterEach(func() {
+		mgr.cancel()
+	})
+
+	Describe("basic IPv6 proxy NDP entry", func() {
+		BeforeEach(func() {
+			nl.setIfaceAddr("eth0", "fd00::1/64")
+			sendIfaceCIDRUpdate(mgr, "eth0", "fd00::1/128")
+			mgr.OnUpdate(wepUpdateV6("k8s", "default/pod1", "eth0", "fd00::50/128"))
+			err := mgr.CompleteDeferredWork()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should add a proxy NDP entry for the pod IPv6 on eth0", func() {
+			entries := nl.getEntries()
+			Expect(entries).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "fd00::50"}))
+		})
+
+		It("should send unsolicited NA", func() {
+			Eventually(func() []garpCall {
+				return unaSender.getCalls()
+			}).Should(ContainElement(garpCall{ifaceName: "eth0", podIP: "fd00::50"}))
+		})
+	})
+
+	Describe("IPv6 workload removed", func() {
+		BeforeEach(func() {
+			nl.setIfaceAddr("eth0", "fd00::1/64")
+			sendIfaceCIDRUpdate(mgr, "eth0", "fd00::1/128")
+			mgr.OnUpdate(wepUpdateV6("k8s", "default/pod1", "eth0", "fd00::50/128"))
+			err := mgr.CompleteDeferredWork()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(nl.getEntries()).To(HaveLen(1))
+
+			mgr.OnUpdate(wepRemove("k8s", "default/pod1", "eth0"))
+			err = mgr.CompleteDeferredWork()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should remove the proxy NDP entry", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("IPv4 addresses filtered in IPv6 manager", func() {
+		BeforeEach(func() {
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
+			err := mgr.CompleteDeferredWork()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should not add any proxy NDP entries", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("multiple IPv6 pods same interface", func() {
+		BeforeEach(func() {
+			nl.setIfaceAddr("eth0", "fd00::1/64")
+			sendIfaceCIDRUpdate(mgr, "eth0", "fd00::1/128")
+			mgr.OnUpdate(wepUpdateV6("k8s", "default/pod1", "eth0", "fd00::50/128"))
+			mgr.OnUpdate(wepUpdateV6("k8s", "default/pod2", "eth0", "fd00::51/128"))
+			err := mgr.CompleteDeferredWork()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should add proxy NDP entries for both pods", func() {
+			entries := nl.getEntries()
+			Expect(entries).To(HaveLen(2))
+			Expect(entries).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "fd00::50"}))
+			Expect(entries).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "fd00::51"}))
+		})
+	})
+
 })

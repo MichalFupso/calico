@@ -122,6 +122,7 @@ require (
 
 require (
 	github.com/j-keck/arping v1.0.3 // indirect
+	github.com/mdlayher/ndp v1.1.0 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
 )
 require (
