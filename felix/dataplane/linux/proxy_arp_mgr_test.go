@@ -182,12 +182,46 @@ func (m *mockGARPSender) reset() {
 }
 
 func newTestProxyARPManager(nl *mockNetlinkForProxyARP, garpSender *mockGARPSender) *proxyARPManager {
+	return newTestProxyARPManagerWithHostname(nl, garpSender, "test-node")
+}
+
+func newTestProxyARPManagerWithHostname(nl *mockNetlinkForProxyARP, garpSender *mockGARPSender, hostname string) *proxyARPManager {
 	config := Config{
+		Hostname: hostname,
 		RulesConfig: rules.Config{
 			WorkloadIfacePrefixes: []string{"cali"},
 		},
 	}
 	return newProxyARPManagerWithShims(config, 4, nl, garpSender.send)
+}
+
+func svcUpdate(name, namespace, svcType string, ingressIPs ...string) *proto.ServiceUpdate {
+	return &proto.ServiceUpdate{
+		Name:                   name,
+		Namespace:              namespace,
+		Type:                   svcType,
+		LoadbalancerIngressIps: ingressIPs,
+	}
+}
+
+func svcRemove(name, namespace string) *proto.ServiceRemove {
+	return &proto.ServiceRemove{
+		Name:      name,
+		Namespace: namespace,
+	}
+}
+
+func sendHostMetadata(mgr *proxyARPManager, hostname, ipv4Addr string) {
+	mgr.OnUpdate(&proto.HostMetadataV4V6Update{
+		Hostname: hostname,
+		Ipv4Addr: ipv4Addr,
+	})
+}
+
+func sendHostMetadataRemove(mgr *proxyARPManager, hostname string) {
+	mgr.OnUpdate(&proto.HostMetadataV4V6Remove{
+		Hostname: hostname,
+	})
 }
 
 // Helper to create a WorkloadEndpointUpdate.
@@ -487,6 +521,348 @@ var _ = Describe("Proxy ARP manager", func() {
 		})
 
 		It("should not add any proxy ARP entries", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+})
+
+var _ = Describe("Proxy ARP manager - LoadBalancer IPs", func() {
+	var (
+		mgr        *proxyARPManager
+		nl         *mockNetlinkForProxyARP
+		garpSender *mockGARPSender
+	)
+
+	// With nodes ["node-a","node-b","node-c"], FNV-1a hash selects:
+	//   "10.0.0.100" -> node-c (idx 2)
+	//   "10.0.0.101" -> node-a (idx 0)
+	//   "10.0.0.102" -> node-b (idx 1)
+
+	setupThreeNodes := func(mgr *proxyARPManager) {
+		sendHostMetadata(mgr, "node-a", "1.1.1.1")
+		sendHostMetadata(mgr, "node-b", "1.1.1.2")
+		sendHostMetadata(mgr, "node-c", "1.1.1.3")
+	}
+
+	Describe("LB IP on selected node", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			// "10.0.0.100" hashes to node-c with 3 nodes.
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should add a proxy ARP entry", func() {
+			Expect(nl.getEntries()).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.100"}))
+		})
+
+		It("should send GARP", func() {
+			Eventually(func() []garpCall {
+				return garpSender.getCalls()
+			}).Should(ContainElement(garpCall{ifaceName: "eth0", podIP: "10.0.0.100"}))
+		})
+	})
+
+	Describe("LB IP on non-selected node", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			// "10.0.0.100" hashes to node-c, but we are node-a.
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-a")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should not add a proxy ARP entry", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("service removed cleans up entry", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+			Expect(nl.getEntries()).To(HaveLen(1))
+
+			mgr.OnUpdate(svcRemove("my-svc", "default"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should remove the proxy ARP entry", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("node added causes re-evaluation", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			// With 2 nodes ["node-a","node-b"], "10.0.0.100" hashes to node-b (idx 1).
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-b")
+			sendHostMetadata(mgr, "node-a", "1.1.1.1")
+			sendHostMetadata(mgr, "node-b", "1.1.1.2")
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+			Expect(nl.getEntries()).To(HaveLen(1))
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should remove entry when hash changes after adding a third node", func() {
+			// Adding node-c changes the hash: "10.0.0.100" now selects node-c, not node-b.
+			sendHostMetadata(mgr, "node-c", "1.1.1.3")
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("node removed causes re-evaluation", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			// With 3 nodes, "10.0.0.100" -> node-c. We are node-b (not selected).
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-b")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should add entry when hash changes after removing node-c", func() {
+			// Removing node-c leaves ["node-a","node-b"]: "10.0.0.100" -> node-b (idx 1).
+			sendHostMetadataRemove(mgr, "node-c")
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+			Expect(nl.getEntries()).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.100"}))
+		})
+	})
+
+	Describe("non-LoadBalancer service type ignored", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "ClusterIP", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should not add any proxy ARP entries", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("LB IP outside host subnet", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			// "192.168.1.100" hashes to node-a with 3 nodes.
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-a")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "192.168.1.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should not add any proxy ARP entries", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("multiple LB services", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			// "10.0.0.100" -> node-c, "10.0.0.101" -> node-a. We are node-c.
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("svc-1", "default", "LoadBalancer", "10.0.0.100"))
+			mgr.OnUpdate(svcUpdate("svc-2", "default", "LoadBalancer", "10.0.0.101"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should only add entry for the IP this node is selected for", func() {
+			entries := nl.getEntries()
+			Expect(entries).To(HaveLen(1))
+			Expect(entries).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.100"}))
+		})
+	})
+
+	Describe("deprecated loadbalancer_ip field", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			// Use the deprecated LoadbalancerIp field instead of LoadbalancerIngressIps.
+			mgr.OnUpdate(&proto.ServiceUpdate{
+				Name:           "my-svc",
+				Namespace:      "default",
+				Type:           "LoadBalancer",
+				LoadbalancerIp: "10.0.0.100",
+			})
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should still add a proxy ARP entry", func() {
+			Expect(nl.getEntries()).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.100"}))
+		})
+	})
+
+	Describe("pod IPs and LB IPs coexist", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(wepUpdate("k8s", "default/pod1", "eth0", "10.0.0.50/32"))
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should have entries for both pod IP and LB IP", func() {
+			entries := nl.getEntries()
+			Expect(entries).To(HaveLen(2))
+			Expect(entries).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.50"}))
+			Expect(entries).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.100"}))
+		})
+	})
+
+	Describe("selectNodeForIP", func() {
+		It("should be deterministic", func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+
+			result1 := mgr.selectNodeForIP("10.0.0.100")
+			result2 := mgr.selectNodeForIP("10.0.0.100")
+			Expect(result1).To(Equal(result2))
+			Expect(result1).To(BeTrue()) // node-c is selected for this IP
+			mgr.cancel()
+		})
+
+		It("should return false with zero nodes", func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-a")
+			Expect(mgr.selectNodeForIP("10.0.0.100")).To(BeFalse())
+			mgr.cancel()
+		})
+	})
+
+	Describe("no duplicate GARP on re-reconciliation for LB IP", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+
+			Eventually(func() int {
+				return len(garpSender.getCalls())
+			}).Should(Equal(1))
+
+			garpSender.reset()
+			mgr.dirty = true
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should not send duplicate GARP", func() {
+			Consistently(func() int {
+				return len(garpSender.getCalls())
+			}).Should(Equal(0))
+		})
+	})
+
+	Describe("IPv6 LB IP filtered in IPv4 manager", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-a")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "fd00::100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should not add any proxy ARP entries", func() {
+			Expect(nl.getEntries()).To(BeEmpty())
+		})
+	})
+
+	Describe("service type changed from LoadBalancer to ClusterIP", func() {
+		BeforeEach(func() {
+			nl = newMockNetlinkForProxyARP()
+			garpSender = newMockGARPSender()
+			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
+			setupThreeNodes(mgr)
+			nl.setIfaceAddr("eth0", "10.0.0.1/24")
+			sendIfaceCIDRUpdate(mgr, "eth0", "10.0.0.1/32")
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "LoadBalancer", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+			Expect(nl.getEntries()).To(HaveLen(1))
+
+			// Service type changed to ClusterIP.
+			mgr.OnUpdate(svcUpdate("my-svc", "default", "ClusterIP", "10.0.0.100"))
+			Expect(mgr.CompleteDeferredWork()).To(Succeed())
+		})
+
+		AfterEach(func() { mgr.cancel() })
+
+		It("should remove the proxy ARP entry", func() {
 			Expect(nl.getEntries()).To(BeEmpty())
 		})
 	})

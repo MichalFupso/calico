@@ -17,9 +17,11 @@ package intdataplane
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/j-keck/arping"
@@ -46,11 +48,14 @@ type proxyARPEntry struct {
 // BGP or overlay encapsulation, while only responding to ARP for specific pod IPs rather
 // than enabling blanket proxy ARP on the interface.
 //
-// The manager uses WorkloadEndpointUpdate messages to learn pod IPs. The subnet overlap
-// between pod IPs and host interface CIDRs is the sole criterion for programming proxy
-// ARP entries — no IPAM pool encapsulation mode check is required.
+// The manager handles two categories of IPs:
+//   - Pod IPs: learned from WorkloadEndpointUpdate messages. The hosting node always
+//     answers ARP for its own pods.
+//   - Service LoadBalancer IPs: learned from ServiceUpdate messages. A deterministic
+//     hash selects exactly one cluster node to answer ARP for each LB IP.
 type proxyARPManager struct {
 	ipVersion      uint8
+	hostname       string
 	wlIfacesRegexp *regexp.Regexp
 
 	// hostIfaceToCIDRs maps host interface name to the parsed CIDRs on that interface.
@@ -59,6 +64,12 @@ type proxyARPManager struct {
 	// localWorkloadIPs maps workload endpoint key to the pod's IP strings.
 	// Key is "orchestratorID/workloadID/endpointID".
 	localWorkloadIPs map[string][]string
+
+	// lbServiceIPs maps "namespace/name" to LoadBalancer ingress IP strings.
+	lbServiceIPs map[string][]string
+
+	// clusterNodes maps hostname to IP address string for all known cluster nodes.
+	clusterNodes map[string]string
 
 	// activeProxyEntries tracks which proxy ARP entries are currently programmed.
 	activeProxyEntries map[proxyARPEntry]bool
@@ -105,9 +116,12 @@ func newProxyARPManagerWithShims(
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &proxyARPManager{
 		ipVersion:          ipVersion,
+		hostname:           dpConfig.Hostname,
 		wlIfacesRegexp:     wlIfacesRegexp,
 		hostIfaceToCIDRs:   make(map[string][]net.IPNet),
 		localWorkloadIPs:   make(map[string][]string),
+		lbServiceIPs:       make(map[string][]string),
+		clusterNodes:       make(map[string]string),
 		activeProxyEntries: make(map[proxyARPEntry]bool),
 		nlHandle:           nl,
 		sendGARP:           garpSender,
@@ -164,6 +178,68 @@ func (m *proxyARPManager) OnUpdate(protoBufMsg any) {
 			delete(m.localWorkloadIPs, wlKey)
 			m.dirty = true
 		}
+
+	case *proto.ServiceUpdate:
+		svcKey := msg.Namespace + "/" + msg.Name
+		if msg.Type != "LoadBalancer" {
+			if _, ok := m.lbServiceIPs[svcKey]; ok {
+				delete(m.lbServiceIPs, svcKey)
+				m.dirty = true
+			}
+			return
+		}
+		var lbIPs []string
+		for _, ipStr := range msg.LoadbalancerIngressIps {
+			if m.isMatchingIPVersion(ipStr) {
+				lbIPs = append(lbIPs, ipStr)
+			}
+		}
+		if msg.LoadbalancerIp != "" && m.isMatchingIPVersion(msg.LoadbalancerIp) {
+			lbIPs = append(lbIPs, msg.LoadbalancerIp)
+		}
+		log.WithFields(log.Fields{
+			"service": svcKey,
+			"lbIPs":   lbIPs,
+		}).Debug("Proxy ARP manager received ServiceUpdate")
+		if len(lbIPs) > 0 {
+			m.lbServiceIPs[svcKey] = lbIPs
+		} else {
+			delete(m.lbServiceIPs, svcKey)
+		}
+		m.dirty = true
+
+	case *proto.ServiceRemove:
+		svcKey := msg.Namespace + "/" + msg.Name
+		if _, ok := m.lbServiceIPs[svcKey]; ok {
+			log.WithField("service", svcKey).Debug("Proxy ARP manager received ServiceRemove")
+			delete(m.lbServiceIPs, svcKey)
+			m.dirty = true
+		}
+
+	case *proto.HostMetadataV4V6Update:
+		addr := msg.Ipv4Addr
+		if m.ipVersion == 6 {
+			addr = msg.Ipv6Addr
+		}
+		if addr == "" {
+			return
+		}
+		if idx := strings.IndexByte(addr, '/'); idx >= 0 {
+			addr = addr[:idx]
+		}
+		log.WithFields(log.Fields{
+			"hostname": msg.Hostname,
+			"addr":     addr,
+		}).Debug("Proxy ARP manager received HostMetadataV4V6Update")
+		m.clusterNodes[msg.Hostname] = addr
+		m.dirty = true
+
+	case *proto.HostMetadataV4V6Remove:
+		if _, ok := m.clusterNodes[msg.Hostname]; ok {
+			log.WithField("hostname", msg.Hostname).Debug("Proxy ARP manager received HostMetadataV4V6Remove")
+			delete(m.clusterNodes, msg.Hostname)
+			m.dirty = true
+		}
 	}
 }
 
@@ -176,29 +252,39 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 	log.WithFields(log.Fields{
 		"numWorkloads":  len(m.localWorkloadIPs),
 		"numHostIfaces": len(m.hostIfaceToCIDRs),
+		"numLBServices": len(m.lbServiceIPs),
+		"numNodes":      len(m.clusterNodes),
 	}).Debug("Proxy ARP manager CompleteDeferredWork")
 
-	// Build desired state: which (interface, podIP) pairs need proxy ARP entries.
+	// Build desired state: which (interface, IP) pairs need proxy ARP entries.
 	desired := make(map[proxyARPEntry]bool)
 
+	// Pod IPs: the hosting node always answers ARP for its own pods.
 	for _, ipNets := range m.localWorkloadIPs {
 		for _, ipNet := range ipNets {
 			podIP := parsePodIP(ipNet)
 			if podIP == nil {
 				continue
 			}
-			for ifaceName, cidrs := range m.hostIfaceToCIDRs {
-				for _, cidr := range cidrs {
-					if cidr.Contains(podIP) {
-						desired[proxyARPEntry{ifaceName: ifaceName, podIP: podIP.String()}] = true
-						break
-					}
-				}
-			}
+			m.addMatchingEntries(desired, podIP)
 		}
 	}
 
-	// Add new proxy ARP entries and send GARP for newly-appearing pods.
+	// LoadBalancer IPs: hash-based node selection picks one node per IP.
+	for _, lbIPs := range m.lbServiceIPs {
+		for _, ipStr := range lbIPs {
+			if !m.selectNodeForIP(ipStr) {
+				continue
+			}
+			lbIP := net.ParseIP(ipStr)
+			if lbIP == nil {
+				continue
+			}
+			m.addMatchingEntries(desired, lbIP)
+		}
+	}
+
+	// Add new proxy ARP entries and send GARP for newly-appearing IPs.
 	for entry := range desired {
 		if !m.activeProxyEntries[entry] {
 			m.addProxyARPEntry(entry)
@@ -225,6 +311,52 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 
 	m.activeProxyEntries = desired
 	return nil
+}
+
+// addMatchingEntries adds proxy ARP entries to the desired set for the given IP
+// on every host interface whose subnet contains that IP.
+func (m *proxyARPManager) addMatchingEntries(desired map[proxyARPEntry]bool, ip net.IP) {
+	for ifaceName, cidrs := range m.hostIfaceToCIDRs {
+		for _, cidr := range cidrs {
+			if cidr.Contains(ip) {
+				desired[proxyARPEntry{ifaceName: ifaceName, podIP: ip.String()}] = true
+				break
+			}
+		}
+	}
+}
+
+// selectNodeForIP uses a deterministic hash to select which cluster node should
+// answer ARP for the given IP. Returns true if this node is the selected node.
+func (m *proxyARPManager) selectNodeForIP(ipStr string) bool {
+	nodeCount := len(m.clusterNodes)
+	if nodeCount == 0 {
+		return false
+	}
+	hostnames := make([]string, 0, nodeCount)
+	for hostname := range m.clusterNodes {
+		hostnames = append(hostnames, hostname)
+	}
+	sort.Strings(hostnames)
+
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(ipStr))
+	idx := int(h.Sum32()) % nodeCount
+
+	return hostnames[idx] == m.hostname
+}
+
+// isMatchingIPVersion returns true if the given IP string is the correct version
+// for this manager instance.
+func (m *proxyARPManager) isMatchingIPVersion(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if m.ipVersion == 4 {
+		return ip.To4() != nil
+	}
+	return ip.To4() == nil
 }
 
 func (m *proxyARPManager) updateHostIfaceCIDRs(ifaceName string, addrCIDRs set.Set[string]) {
