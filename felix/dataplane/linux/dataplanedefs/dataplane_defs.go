@@ -25,4 +25,9 @@ const (
 
 	BPFInDev  = "bpfin.cali"
 	BPFOutDev = "bpfout.cali"
+
+	// ProxyARPDummyIface is the dummy interface used by the proxy ARP manager to
+	// hold /32 routes for LoadBalancer VIPs. Uses the "cali" prefix to avoid
+	// colliding with real host interfaces.
+	ProxyARPDummyIface = "cali-lb-arp"
 )

@@ -32,6 +32,7 @@ func NewMainTable(
 	deviceRouteProto netlink.RouteProtocol,
 	workloadIfacePrefixes []string,
 	removeExternalRoutes bool,
+	nonManagedInterfaces []string,
 ) *MainTableOwnershipPolicy {
 	var allRouteProtos []netlink.RouteProtocol
 	var exclusiveRouteProtos []netlink.RouteProtocol
@@ -68,6 +69,7 @@ func NewMainTable(
 			// Not including tunl0, it is managed by BIRD.
 			// Not including Wireguard, it has its own routing table.
 		},
+		NonManagedInterfaces:    nonManagedInterfaces,
 		AllRouteProtocols:       allRouteProtos,
 		ExclusiveRouteProtocols: exclusiveRouteProtos,
 	}
@@ -87,6 +89,13 @@ type MainTableOwnershipPolicy struct {
 	// CalicoSpecialInterfaces is a list of interfaces that Calico uses for
 	// tunnels and special purposes.
 	CalicoSpecialInterfaces []string
+
+	// NonManagedInterfaces is a list of Calico-owned interfaces whose routes
+	// are managed by a different component (not the route table syncer).
+	// Routes on these interfaces are ignored even if the interface name matches
+	// a workload prefix. For example, the proxy ARP dummy interface uses a
+	// "cali" prefix but its routes are managed by the proxyARPManager.
+	NonManagedInterfaces []string
 
 	// AllRouteProtocols is a list of protocols that Calico uses,
 	// but may be used by other software too.
@@ -136,6 +145,14 @@ func (d *MainTableOwnershipPolicy) RouteIsOurs(ifaceName string, route *netlink.
 	// of our exclusive proto values, so, if we got no hit above, we
 	// can assume it's not ours.
 	if ifaceName == routetable.InterfaceNone {
+		return false
+	}
+
+	// Some Calico-owned interfaces have routes managed by a different
+	// component (e.g. the proxy ARP manager). We must not claim
+	// ownership of those routes, even though the interface name may
+	// match a workload prefix.
+	if slices.Contains(d.NonManagedInterfaces, ifaceName) {
 		return false
 	}
 

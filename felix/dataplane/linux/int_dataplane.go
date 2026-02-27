@@ -371,6 +371,7 @@ type InternalDataplane struct {
 	allManagers             []Manager
 	managersWithRouteTables []ManagerWithRouteTables
 	managersWithRouteRules  []ManagerWithRouteRules
+	proxyARPManagers        []*proxyARPManager
 	ruleRenderer            rules.RuleRenderer
 
 	// datastoreInSync is set to true after we receive the "in sync" message from the datastore.
@@ -651,6 +652,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 				config.DeviceRouteProtocol,
 				config.RulesConfig.WorkloadIfacePrefixes,
 				config.RemoveExternalRoutes,
+				[]string{dataplanedefs.ProxyARPDummyIface},
 			),
 			4,
 			config.NetlinkTimeout,
@@ -671,6 +673,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 					config.DeviceRouteProtocol,
 					config.RulesConfig.WorkloadIfacePrefixes,
 					config.RemoveExternalRoutes,
+					[]string{dataplanedefs.ProxyARPDummyIface},
 				),
 				6,
 				config.NetlinkTimeout,
@@ -744,9 +747,13 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 	// the same subnet as a host physical interface and add per-IP proxy ARP (IPv4) or
 	// proxy NDP (IPv6) entries on that interface. Registered unconditionally since
 	// the detection is dynamic.
-	dp.RegisterManager(newProxyARPManager(config, 4))
+	proxyARPMgr4 := newProxyARPManager(config, 4)
+	dp.RegisterManager(proxyARPMgr4)
+	dp.proxyARPManagers = append(dp.proxyARPManagers, proxyARPMgr4)
 	if config.IPv6Enabled {
-		dp.RegisterManager(newProxyARPManager(config, 6))
+		proxyARPMgr6 := newProxyARPManager(config, 6)
+		dp.RegisterManager(proxyARPMgr6)
+		dp.proxyARPManagers = append(dp.proxyARPManagers, proxyARPMgr6)
 	}
 
 	dataplaneFeatures := featureDetector.GetFeatures()
@@ -2770,6 +2777,9 @@ func (d *InternalDataplane) apply() {
 		}
 		for _, fdb := range d.vxlanFDBs {
 			fdb.QueueResync()
+		}
+		for _, m := range d.proxyARPManagers {
+			m.QueueResync()
 		}
 		d.forceRouteRefresh = false
 	}
