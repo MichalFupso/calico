@@ -121,10 +121,11 @@ require (
 )
 
 require (
-	github.com/j-keck/arping v1.0.3 // indirect
-	github.com/mdlayher/ndp v1.1.0 // indirect
+	github.com/j-keck/arping v1.0.3
+	github.com/mdlayher/ndp v1.1.0
 	golang.org/x/crypto v0.47.0 // indirect
 )
+
 require (
 	github.com/docker/distribution v2.8.3+incompatible // indirect
 	github.com/docker/docker v28.5.1+incompatible // indirect
@@ -139,6 +140,8 @@ require (
 	golang.org/x/crypto v0.47.0 // indirect
 	kubevirt.io/api v1.8.0-alpha.0
 	kubevirt.io/client-go v1.8.0-alpha.0
+	kubevirt.io/api v1.7.0
+	kubevirt.io/client-go v1.7.0
 )
 
 require (
