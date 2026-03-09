@@ -380,8 +380,10 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 	}
 
 	// LoadBalancer IPs: hash-based node selection picks one node per IP.
-	// Unlike pod IPs, LB VIPs have no veth so we must add /32 routes via a dummy
-	// interface for the kernel's per-IP proxy ARP to work.
+	// For IPv4, LB VIPs have no veth so we must add /32 routes via a dummy interface
+	// for the kernel's per-IP proxy ARP to work (the rt->dst.dev != dev check in
+	// net/ipv4/arp.c). IPv6 NDP proxy does not have this check — the kernel only
+	// requires the proxy_ndp sysctl and a per-IP entry — so no dummy routes are needed.
 	for _, lbIPs := range m.lbServiceIPs {
 		for _, ipStr := range lbIPs {
 			if !m.selectNodeForIP(ipStr) {
@@ -391,13 +393,13 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 			if lbIP == nil {
 				continue
 			}
-			if m.addMatchingEntries(desired, lbIP) {
+			if m.addMatchingEntries(desired, lbIP) && m.ipVersion == 4 {
 				desiredLBRoutes.Add(ipStr)
 			}
 		}
 	}
 
-	// Reconcile /32 routes for LB VIPs on the dummy interface.
+	// Reconcile /32 routes for LB VIPs on the dummy interface (IPv4 only).
 	// Routes must be added BEFORE proxy entries (the kernel needs the route to
 	// satisfy the rt->dst.dev != dev check). Routes are removed AFTER proxy entries.
 	desiredLBRoutes.Iter(func(ipStr string) error {
