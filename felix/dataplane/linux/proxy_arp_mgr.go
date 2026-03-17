@@ -21,7 +21,6 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/j-keck/arping"
@@ -101,11 +100,10 @@ type proxyARPManager struct {
 	// route resolve to the dummy (not eth0), enabling the per-IP proxy entry to fire.
 	activeLBRoutes set.Set[string] // set of IP strings with active /32 routes
 
-	// activeProxyNDPIfaces tracks interfaces where proxy_ndp sysctl is currently
-	// enabled. For IPv6, the kernel requires /proc/sys/net/ipv6/conf/<iface>/proxy_ndp=1
-	// for per-IP NDP proxy entries to take effect. We enable it when an interface gains
-	// its first entry and disable it when the last entry is removed.
-	activeProxyNDPIfaces set.Set[string]
+	// noEncapPools maps IPPool ID to the pool's parsed CIDR. Only pools with no
+	// encapsulation (both IpipMode and VxlanMode are "" or "Never") are tracked.
+	// IPs must fall within a no-encap pool to be eligible for proxy ARP.
+	noEncapPools map[string]net.IPNet
 
 	dirty        bool
 	resyncNeeded bool
@@ -151,21 +149,21 @@ func newProxyARPManagerWithShims(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &proxyARPManager{
-		ipVersion:            ipVersion,
-		hostname:             dpConfig.Hostname,
-		wlIfacesRegexp:       wlIfacesRegexp,
-		hostIfaceToCIDRs:     make(map[string][]net.IPNet),
-		localWorkloadIPs:     make(map[string][]string),
-		lbServiceIPs:         make(map[string][]string),
-		clusterNodes:         make(map[string]string),
-		activeProxyEntries:   make(map[proxyARPEntry]bool),
-		activeLBRoutes:       set.New[string](),
-		activeProxyNDPIfaces: set.New[string](),
-		nlHandle:             nl,
-		sendGARP:             garpSender,
-		writeProcSys:         procSysWriter,
-		garpC:                make(chan garpRequest, 100),
-		cancel:               cancel,
+		ipVersion:          ipVersion,
+		hostname:           dpConfig.Hostname,
+		wlIfacesRegexp:     wlIfacesRegexp,
+		hostIfaceToCIDRs:   make(map[string][]net.IPNet),
+		localWorkloadIPs:   make(map[string][]string),
+		lbServiceIPs:       make(map[string][]string),
+		clusterNodes:       make(map[string]string),
+		activeProxyEntries: make(map[proxyARPEntry]bool),
+		activeLBRoutes:     set.New[string](),
+		noEncapPools:       make(map[string]net.IPNet),
+		nlHandle:           nl,
+		sendGARP:           garpSender,
+		writeProcSys:       procSysWriter,
+		garpC:              make(chan garpRequest, 100),
+		cancel:             cancel,
 	}
 	go m.garpWorker(ctx)
 	return m
@@ -173,14 +171,27 @@ func newProxyARPManagerWithShims(
 
 func (m *proxyARPManager) OnUpdate(protoBufMsg any) {
 	switch msg := protoBufMsg.(type) {
-	case *ifaceAddrsCIDRUpdate:
+	case *ifaceAddrsUpdate:
+		if msg.AddrCIDRs == nil && msg.Addrs == nil {
+			// Interface removed.
+			if m.wlIfacesRegexp.MatchString(msg.Name) {
+				return
+			}
+			m.updateHostIfaceCIDRs(msg.Name, nil)
+			m.dirty = true
+			return
+		}
+		if msg.AddrCIDRs == nil {
+			// No CIDR data — nothing for the proxy ARP manager to do.
+			return
+		}
 		if m.wlIfacesRegexp.MatchString(msg.Name) {
 			return
 		}
 		log.WithFields(log.Fields{
 			"ifaceName": msg.Name,
 			"addrCIDRs": msg.AddrCIDRs,
-		}).Debug("Proxy ARP manager received ifaceAddrsCIDRUpdate")
+		}).Debug("Proxy ARP manager received ifaceAddrsUpdate")
 		m.updateHostIfaceCIDRs(msg.Name, msg.AddrCIDRs)
 		m.dirty = true
 
@@ -279,6 +290,36 @@ func (m *proxyARPManager) OnUpdate(protoBufMsg any) {
 			delete(m.clusterNodes, msg.Hostname)
 			m.dirty = true
 		}
+
+	case *proto.IPAMPoolUpdate:
+		pool := msg.GetPool()
+		if pool == nil {
+			return
+		}
+		if isNoEncapPool(pool) {
+			_, cidr, err := net.ParseCIDR(pool.Cidr)
+			if err != nil {
+				log.WithError(err).WithField("cidr", pool.Cidr).Warn("Failed to parse IPPool CIDR")
+				return
+			}
+			log.WithFields(log.Fields{
+				"poolID": msg.Id,
+				"cidr":   pool.Cidr,
+			}).Debug("Proxy ARP manager tracking no-encap IPPool")
+			m.noEncapPools[msg.Id] = *cidr
+		} else {
+			if _, ok := m.noEncapPools[msg.Id]; ok {
+				delete(m.noEncapPools, msg.Id)
+			}
+		}
+		m.dirty = true
+
+	case *proto.IPAMPoolRemove:
+		if _, ok := m.noEncapPools[msg.Id]; ok {
+			log.WithField("poolID", msg.Id).Debug("Proxy ARP manager received IPAMPoolRemove")
+			delete(m.noEncapPools, msg.Id)
+			m.dirty = true
+		}
 	}
 }
 
@@ -369,10 +410,14 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 
 	// Pod IPs: the hosting node always answers ARP for its own pods.
 	// These already have /32 routes via their cali* veths so no extra route is needed.
+	// Only IPs belonging to no-encap IPPools are eligible.
 	for _, ipNets := range m.localWorkloadIPs {
 		for _, ipNet := range ipNets {
 			podIP := parsePodIP(ipNet)
 			if podIP == nil {
+				continue
+			}
+			if !m.isInNoEncapPool(podIP) {
 				continue
 			}
 			m.addMatchingEntries(desired, podIP)
@@ -391,6 +436,9 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 			}
 			lbIP := net.ParseIP(ipStr)
 			if lbIP == nil {
+				continue
+			}
+			if !m.isInNoEncapPool(lbIP) {
 				continue
 			}
 			if m.addMatchingEntries(desired, lbIP) && m.ipVersion == 4 {
@@ -442,33 +490,12 @@ func (m *proxyARPManager) CompleteDeferredWork() error {
 		return nil
 	})
 
-	// For IPv6, enable proxy_ndp sysctl on interfaces that have entries. The kernel
-	// requires /proc/sys/net/ipv6/conf/<iface>/proxy_ndp=1 for per-IP NDP proxy entries
-	// to take effect. This is safe to leave enabled — unlike blanket proxy_arp on IPv4,
-	// proxy_ndp only enables the per-IP mechanism (the kernel only responds for explicitly
-	// configured proxy entries, not for all addresses).
-	if m.ipVersion == 6 {
-		for entry := range desired {
-			if !m.activeProxyNDPIfaces.Contains(entry.ifaceName) {
-				m.setProxyNDP(entry.ifaceName)
-				m.activeProxyNDPIfaces.Add(entry.ifaceName)
-			}
-		}
-	}
+	// proxy_ndp sysctl is set at startup by setupProxyARPStartup() on all host
+	// interfaces, so no per-interface lazy setup is needed here.
 
 	m.activeProxyEntries = desired
 	m.activeLBRoutes = desiredLBRoutes
 	return nil
-}
-
-// setProxyNDP enables the proxy_ndp sysctl for the given interface.
-func (m *proxyARPManager) setProxyNDP(ifaceName string) {
-	path := fmt.Sprintf(proxyNDPProcSysTemplate, ifaceName)
-	if err := m.writeProcSys(path, "1"); err != nil {
-		log.WithError(err).WithField("iface", ifaceName).Warn("Failed to enable proxy_ndp sysctl")
-		return
-	}
-	log.WithField("iface", ifaceName).Info("Enabled proxy_ndp sysctl on interface")
 }
 
 // addMatchingEntries adds proxy ARP entries to the desired set for the given IP
@@ -488,24 +515,27 @@ func (m *proxyARPManager) addMatchingEntries(desired map[proxyARPEntry]bool, ip 
 	return added
 }
 
-// selectNodeForIP uses a deterministic hash to select which cluster node should
-// answer ARP for the given IP. Returns true if this node is the selected node.
+// selectNodeForIP uses Rendezvous hashing (Highest Random Weight) to select
+// which cluster node should answer ARP for the given IP. For each node, it
+// computes FNV-32a(VIP + hostname) and picks the node with the highest score.
+// Returns true if this node is the selected node.
 func (m *proxyARPManager) selectNodeForIP(ipStr string) bool {
-	nodeCount := len(m.clusterNodes)
-	if nodeCount == 0 {
+	if len(m.clusterNodes) == 0 {
 		return false
 	}
-	hostnames := make([]string, 0, nodeCount)
+	var bestScore uint32
+	var bestNode string
 	for hostname := range m.clusterNodes {
-		hostnames = append(hostnames, hostname)
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(ipStr))
+		_, _ = h.Write([]byte(hostname))
+		score := h.Sum32()
+		if score > bestScore || (score == bestScore && hostname > bestNode) {
+			bestScore = score
+			bestNode = hostname
+		}
 	}
-	sort.Strings(hostnames)
-
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(ipStr))
-	idx := int(h.Sum32()) % nodeCount
-
-	return hostnames[idx] == m.hostname
+	return bestNode == m.hostname
 }
 
 // isMatchingIPVersion returns true if the given IP string is the correct version
@@ -521,13 +551,29 @@ func (m *proxyARPManager) isMatchingIPVersion(ipStr string) bool {
 	return ip.To4() == nil
 }
 
+// isNoEncapPool returns true if the pool has no encapsulation configured.
+func isNoEncapPool(pool *proto.IPAMPool) bool {
+	return (pool.IpipMode == "" || strings.EqualFold(pool.IpipMode, "Never")) &&
+		(pool.VxlanMode == "" || strings.EqualFold(pool.VxlanMode, "Never"))
+}
+
+// isInNoEncapPool returns true if the given IP falls within any tracked no-encap IPPool.
+func (m *proxyARPManager) isInNoEncapPool(ip net.IP) bool {
+	for _, cidr := range m.noEncapPools {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *proxyARPManager) updateHostIfaceCIDRs(ifaceName string, addrCIDRs set.Set[string]) {
 	if addrCIDRs == nil {
 		delete(m.hostIfaceToCIDRs, ifaceName)
 		return
 	}
 
-	// The ifaceAddrsCIDRUpdate comes from the interface monitor's local route table,
+	// The ifaceAddrsUpdate comes from the interface monitor's local route table,
 	// which has /32 host-scope entries. We need the actual subnet prefix from the
 	// interface address (e.g., /24) to determine if a pod IP falls within the same
 	// L2 subnet. Query the interface addresses directly via netlink.
@@ -788,4 +834,133 @@ func sendUnsolicitedNA(ifaceName string, podIP net.IP) error {
 		return fmt.Errorf("failed to send unsolicited NA for %s on %s: %w", podIP, ifaceName, err)
 	}
 	return nil
+}
+
+const proxyDelayProcSysTemplate = "/proc/sys/net/ipv4/neigh/%s/proxy_delay"
+const ndpProxyDelayProcSysTemplate = "/proc/sys/net/ipv6/neigh/%s/proxy_delay"
+
+// setupProxyARPStartup performs one-time startup setup when ProxyARPEnabled is Enabled.
+// It creates the dummy interface for LB VIP routes and sets proxy_delay=0 and proxy_ndp=1
+// on all host interfaces. This is called from int_dataplane.go before registering managers.
+func setupProxyARPStartup(config Config) {
+	nl, err := netlinkshim.NewRealNetlink()
+	if err != nil {
+		log.WithError(err).Warn("Proxy ARP startup: failed to create netlink handle")
+		return
+	}
+
+	wlIfacesPattern := "^(" + strings.Join(config.RulesConfig.WorkloadIfacePrefixes, "|") + ").*"
+	wlIfacesRegexp := regexp.MustCompile(wlIfacesPattern)
+
+	// Create the dummy interface for LB VIP /32 routes.
+	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: proxyARPDummyIface}}
+	if err := nl.LinkAdd(dummy); err != nil {
+		// Already exists is fine.
+		if existing, lookupErr := nl.LinkByName(proxyARPDummyIface); lookupErr != nil {
+			log.WithError(err).Warn("Proxy ARP startup: failed to create dummy interface")
+		} else {
+			log.WithFields(log.Fields{
+				"iface": proxyARPDummyIface,
+				"index": existing.Attrs().Index,
+			}).Info("Proxy ARP startup: dummy interface already exists")
+		}
+	} else {
+		if err := nl.LinkSetUp(dummy); err != nil {
+			log.WithError(err).Warn("Proxy ARP startup: failed to bring up dummy interface")
+		} else {
+			log.WithField("iface", proxyARPDummyIface).Info("Proxy ARP startup: created dummy interface")
+		}
+	}
+
+	// Set proxy_delay=0 and proxy_ndp=1 on all host interfaces.
+	links, err := nl.LinkList()
+	if err != nil {
+		log.WithError(err).Warn("Proxy ARP startup: failed to list interfaces")
+		return
+	}
+	for _, link := range links {
+		ifaceName := link.Attrs().Name
+		if wlIfacesRegexp.MatchString(ifaceName) || ifaceName == "lo" || ifaceName == proxyARPDummyIface {
+			continue
+		}
+		// IPv4: set proxy_delay=0
+		path := fmt.Sprintf(proxyDelayProcSysTemplate, ifaceName)
+		if err := writeProcSys(path, "0"); err != nil {
+			log.WithError(err).WithField("iface", ifaceName).Debug("Proxy ARP startup: failed to set proxy_delay=0")
+		}
+		// IPv6: set proxy_ndp=1 and NDP proxy_delay=0
+		if config.IPv6Enabled {
+			path = fmt.Sprintf(proxyNDPProcSysTemplate, ifaceName)
+			if err := writeProcSys(path, "1"); err != nil {
+				log.WithError(err).WithField("iface", ifaceName).Debug("Proxy ARP startup: failed to set proxy_ndp=1")
+			}
+			path = fmt.Sprintf(ndpProxyDelayProcSysTemplate, ifaceName)
+			if err := writeProcSys(path, "0"); err != nil {
+				log.WithError(err).WithField("iface", ifaceName).Debug("Proxy ARP startup: failed to set NDP proxy_delay=0")
+			}
+		}
+	}
+	log.Info("Proxy ARP startup: completed startup setup")
+}
+
+// cleanupProxyARPState removes all proxy ARP/NDP state when ProxyARPEnabled is Disabled.
+// It removes all NTF_PROXY neighbor entries on host interfaces and deletes the dummy interface.
+// This is a best-effort operation called from int_dataplane.go during startup.
+func cleanupProxyARPState(config Config) {
+	nl, err := netlinkshim.NewRealNetlink()
+	if err != nil {
+		log.WithError(err).Warn("Proxy ARP cleanup: failed to create netlink handle")
+		return
+	}
+
+	wlIfacesPattern := "^(" + strings.Join(config.RulesConfig.WorkloadIfacePrefixes, "|") + ").*"
+	wlIfacesRegexp := regexp.MustCompile(wlIfacesPattern)
+
+	var removedEntries int
+	links, err := nl.LinkList()
+	if err != nil {
+		log.WithError(err).Warn("Proxy ARP cleanup: failed to list interfaces")
+	} else {
+		for _, link := range links {
+			ifaceName := link.Attrs().Name
+			if wlIfacesRegexp.MatchString(ifaceName) || ifaceName == proxyARPDummyIface {
+				continue
+			}
+			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+				neighs, err := nl.NeighList(link.Attrs().Index, family)
+				if err != nil {
+					log.WithError(err).WithField("iface", ifaceName).Debug("Proxy ARP cleanup: failed to list neighbors")
+					continue
+				}
+				for _, n := range neighs {
+					if n.Flags&netlink.NTF_PROXY != 0 {
+						if err := nl.NeighDel(&n); err != nil {
+							log.WithError(err).WithFields(log.Fields{
+								"iface": ifaceName,
+								"ip":    n.IP,
+							}).Warn("Proxy ARP cleanup: failed to remove proxy neighbor entry")
+						} else {
+							removedEntries++
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Delete the dummy interface (which also removes all its routes).
+	dummyDeleted := false
+	if _, err := nl.LinkByName(proxyARPDummyIface); err == nil {
+		dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: proxyARPDummyIface}}
+		if err := nl.LinkDel(dummy); err != nil {
+			log.WithError(err).Warn("Proxy ARP cleanup: failed to delete dummy interface")
+		} else {
+			dummyDeleted = true
+		}
+	}
+
+	log.WithFields(log.Fields{
+		"removedEntries": removedEntries,
+		"dummyDeleted":   dummyDeleted,
+	}).Info("Proxy ARP cleanup: completed cleanup")
 }

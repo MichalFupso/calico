@@ -314,7 +314,10 @@ func newTestProxyARPManagerWithHostname(nl *mockNetlinkForProxyARP, garpSender *
 			WorkloadIfacePrefixes: []string{"cali"},
 		},
 	}
-	return newProxyARPManagerWithShims(config, 4, nl, garpSender.send, noopProcSysWriter)
+	mgr := newProxyARPManagerWithShims(config, 4, nl, garpSender.send, noopProcSysWriter)
+	// Register a default no-encap pool covering the common test subnet.
+	sendNoEncapPool(mgr, "default-test-pool", "10.0.0.0/8")
+	return mgr
 }
 
 func noopProcSysWriter(_, _ string) error {
@@ -375,8 +378,20 @@ func wepRemove(orchID, wlID, epID string) *proto.WorkloadEndpointRemove {
 	}
 }
 
+// sendNoEncapPool sends an IPAMPoolUpdate with no encapsulation for the given CIDR.
+func sendNoEncapPool(mgr *proxyARPManager, poolID, cidr string) {
+	mgr.OnUpdate(&proto.IPAMPoolUpdate{
+		Id: poolID,
+		Pool: &proto.IPAMPool{
+			Cidr:      cidr,
+			IpipMode:  "Never",
+			VxlanMode: "Never",
+		},
+	})
+}
+
 func sendIfaceCIDRUpdate(mgr *proxyARPManager, name string, cidrs ...string) {
-	mgr.OnUpdate(&ifaceAddrsCIDRUpdate{
+	mgr.OnUpdate(&ifaceAddrsUpdate{
 		Name:      name,
 		AddrCIDRs: set.FromArray(cidrs),
 	})
@@ -619,7 +634,7 @@ var _ = Describe("Proxy ARP manager", func() {
 			Expect(nl.getEntries()).To(HaveLen(1))
 
 			// Interface removed (nil CIDRs).
-			mgr.OnUpdate(&ifaceAddrsCIDRUpdate{Name: "eth0", AddrCIDRs: nil})
+			mgr.OnUpdate(&ifaceAddrsUpdate{Name: "eth0", AddrCIDRs: nil})
 			err = mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
 		})
@@ -659,10 +674,10 @@ var _ = Describe("Proxy ARP manager - LoadBalancer IPs", func() {
 		garpSender *mockGARPSender
 	)
 
-	// With nodes ["node-a","node-b","node-c"], FNV-1a hash selects:
-	//   "10.0.0.100" -> node-c (idx 2)
-	//   "10.0.0.101" -> node-a (idx 0)
-	//   "10.0.0.102" -> node-b (idx 1)
+	// With nodes ["node-a","node-b","node-c"], HRW (Rendezvous) hashing selects:
+	//   "10.0.0.100" -> node-c
+	//   "10.0.0.101" -> node-b
+	//   "10.0.0.102" -> node-a
 
 	setupThreeNodes := func(mgr *proxyARPManager) {
 		sendHostMetadata(mgr, "node-a", "1.1.1.1")
@@ -781,7 +796,7 @@ var _ = Describe("Proxy ARP manager - LoadBalancer IPs", func() {
 		AfterEach(func() { mgr.cancel() })
 
 		It("should add entry when hash changes after removing node-c", func() {
-			// Removing node-c leaves ["node-a","node-b"]: "10.0.0.100" -> node-b (idx 1).
+			// Removing node-c leaves ["node-a","node-b"]: "10.0.0.100" -> node-b (HRW).
 			sendHostMetadataRemove(mgr, "node-c")
 			Expect(mgr.CompleteDeferredWork()).To(Succeed())
 			Expect(nl.getEntries()).To(HaveKey(proxyARPEntry{ifaceName: "eth0", podIP: "10.0.0.100"}))
@@ -831,7 +846,7 @@ var _ = Describe("Proxy ARP manager - LoadBalancer IPs", func() {
 		BeforeEach(func() {
 			nl = newMockNetlinkForProxyARP()
 			garpSender = newMockGARPSender()
-			// "10.0.0.100" -> node-c, "10.0.0.101" -> node-a. We are node-c.
+			// "10.0.0.100" -> node-c, "10.0.0.101" -> node-b. We are node-c.
 			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
 			setupThreeNodes(mgr)
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
@@ -1152,7 +1167,7 @@ var _ = Describe("Proxy ARP manager - LB VIP dummy routes", func() {
 		BeforeEach(func() {
 			nl = newMockNetlinkForProxyARP()
 			garpSender = newMockGARPSender()
-			// "10.0.0.100" -> node-c, "10.0.0.101" -> node-a. We are node-c.
+			// "10.0.0.100" -> node-c, "10.0.0.101" -> node-b. We are node-c.
 			mgr = newTestProxyARPManagerWithHostname(nl, garpSender, "node-c")
 			setupThreeNodes(mgr)
 			nl.setIfaceAddr("eth0", "10.0.0.1/24")
@@ -1269,7 +1284,10 @@ func newTestProxyNDPManager(nl *mockNetlinkForProxyARP, unaSender *mockGARPSende
 			WorkloadIfacePrefixes: []string{"cali"},
 		},
 	}
-	return newProxyARPManagerWithShims(config, 6, nl, unaSender.send, procSys)
+	mgr := newProxyARPManagerWithShims(config, 6, nl, unaSender.send, procSys)
+	// Register a default no-encap pool covering the common IPv6 test subnet.
+	sendNoEncapPool(mgr, "default-test-pool-v6", "fd00::/8")
+	return mgr
 }
 
 // Helper to create a WorkloadEndpointUpdate with IPv6 nets.
@@ -1328,8 +1346,8 @@ var _ = Describe("Proxy NDP manager (IPv6)", func() {
 			}).Should(ContainElement(garpCall{ifaceName: "eth0", podIP: "fd00::50"}))
 		})
 
-		It("should enable proxy_ndp on eth0", func() {
-			Expect(procSysLog).To(HaveKeyWithValue("/proc/sys/net/ipv6/conf/eth0/proxy_ndp", "1"))
+		It("should not set proxy_ndp (now done at startup)", func() {
+			Expect(procSysLog).ToNot(HaveKey("/proc/sys/net/ipv6/conf/eth0/proxy_ndp"))
 		})
 	})
 
@@ -1366,17 +1384,16 @@ var _ = Describe("Proxy NDP manager (IPv6)", func() {
 		})
 	})
 
-	Describe("proxy_ndp not set again on second reconcile", func() {
+	Describe("proxy_ndp not set by manager (set at startup instead)", func() {
 		BeforeEach(func() {
 			nl.setIfaceAddr("eth0", "fd00::1/64")
 			sendIfaceCIDRUpdate(mgr, "eth0", "fd00::1/128")
 			mgr.OnUpdate(wepUpdateV6("k8s", "default/pod1", "eth0", "fd00::50/128"))
 			err := mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
-			Expect(procSysLog).To(HaveKeyWithValue("/proc/sys/net/ipv6/conf/eth0/proxy_ndp", "1"))
+			Expect(procSysLog).ToNot(HaveKey("/proc/sys/net/ipv6/conf/eth0/proxy_ndp"))
 
-			// Clear the log and add another pod to trigger a second reconcile.
-			procSysLog = make(map[string]string)
+			// Add another pod to trigger a second reconcile.
 			mgr.OnUpdate(wepUpdateV6("k8s", "default/pod2", "eth0", "fd00::51/128"))
 			err = mgr.CompleteDeferredWork()
 			Expect(err).ToNot(HaveOccurred())
@@ -1418,6 +1435,7 @@ var _ = Describe("Proxy ARP manager - resync with kernel", func() {
 		nl = newMockNetlinkForProxyARP()
 		garp = newMockGARPSender()
 		mgr = newTestProxyARPManager(nl, garp)
+		sendNoEncapPool(mgr, "resync-pool", "192.168.0.0/16")
 
 		// Set up a host interface with 192.168.1.0/24 on eth0.
 		nl.setIfaceAddr("eth0", "192.168.1.1/24")

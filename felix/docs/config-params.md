@@ -1183,6 +1183,23 @@ Felix always programs such routes for IP Pools with vxlanMode: Always or vxlanMo
 | `FelixConfiguration` schema | One of: <code>"Disabled"</code>, <code>"Enabled"</code>. |
 | Default value (YAML) | `Disabled` |
 
+### `ProxyARPEnabled` (config file) / `proxyARPEnabled` (YAML)
+
+Controls whether Felix automatically programs per-IP proxy
+ARP (IPv4) and proxy NDP (IPv6) entries on host interfaces for local pod IPs
+and selected LoadBalancer VIPs that fall within the same subnet as the host
+interface. When enabled, pods and LB VIPs on the host subnet are reachable
+from the local L2 segment without BGP.
+
+| Detail |   |
+| --- | --- |
+| Environment variable | `FELIX_ProxyARPEnabled` |
+| Encoding (env var/config file) | One of: <code>Disabled</code>, <code>Enabled</code> (case insensitive) |
+| Default value (above encoding) | `Enabled` |
+| `FelixConfiguration` field | `proxyARPEnabled` (YAML) `ProxyARPEnabled` (Go API) |
+| `FelixConfiguration` schema | One of: <code>"Disabled"</code>, <code>"Enabled"</code>. |
+| Default value (YAML) | `Enabled` |
+
 ### `RemoveExternalRoutes` (config file) / `removeExternalRoutes` (YAML)
 
 Controls whether Felix will remove unexpected routes to workload interfaces. Felix will

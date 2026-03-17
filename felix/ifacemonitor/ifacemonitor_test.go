@@ -63,6 +63,11 @@ type addrState struct {
 	addrs     set.Set[string]
 }
 
+type addrCIDRState struct {
+	ifaceName string
+	addrCIDRs set.Set[string]
+}
+
 type linkUpdate struct {
 	name  string
 	state ifacemonitor.State
@@ -72,9 +77,10 @@ type linkUpdate struct {
 type inSyncupdate struct{}
 
 type mockDataplane struct {
-	linkC chan linkUpdate
-	addrC chan addrState
-	syncC chan inSyncupdate
+	linkC     chan linkUpdate
+	addrC     chan addrState
+	addrCIDRC chan addrCIDRState
+	syncC     chan inSyncupdate
 }
 
 func (nl *netlinkTest) addLink(name string) {
@@ -360,10 +366,20 @@ func (dp *mockDataplane) addrStateCallback(ifaceName string, addrs set.Set[strin
 
 func (dp *mockDataplane) notExpectAddrStateCb() {
 	ConsistentlyWithOffset(1, dp.addrC, "50ms", "5ms").ShouldNot(Receive())
+	ConsistentlyWithOffset(1, dp.addrCIDRC, "50ms", "5ms").ShouldNot(Receive())
+}
+
+func (dp *mockDataplane) addrCIDRStateCallback(ifaceName string, addrCIDRs set.Set[string]) {
+	log.WithFields(log.Fields{
+		"ifaceName": ifaceName,
+		"addrCIDRs": addrCIDRs,
+	}).Info("CALLBACK ADDR CIDR")
+	dp.addrCIDRC <- addrCIDRState{ifaceName: ifaceName, addrCIDRs: addrCIDRs}
 }
 
 func (dp *mockDataplane) expectAddrStateCb(ifaceName string, addr string, present bool) {
 	var cbIface addrState
+	var cbCIDR addrCIDRState
 	log.WithFields(log.Fields{
 		"ifaceName": ifaceName,
 		"addr":      addr,
@@ -371,15 +387,20 @@ func (dp *mockDataplane) expectAddrStateCb(ifaceName string, addr string, presen
 	}).Debug("expectAddrStateCb")
 
 	Eventually(dp.addrC).Should(Receive(&cbIface))
+	Eventually(dp.addrCIDRC).Should(Receive(&cbCIDR))
 	log.WithFields(log.Fields{
 		"ifaceName": cbIface.ifaceName,
 		"addrs":     cbIface.addrs,
+		"addrCIDRs": cbCIDR.addrCIDRs,
 	}).Debug("Mock dp got addr cb")
 	ExpectWithOffset(1, cbIface.ifaceName).To(Equal(ifaceName),
 		"Got update for unexpected interface name")
+	ExpectWithOffset(1, cbCIDR.ifaceName).To(Equal(ifaceName),
+		"CIDR callback got unexpected interface name")
 	if (addr == "") && (!present) {
-		// Expected to get a nil addrs.
+		// Expected to get nil addrs.
 		ExpectWithOffset(1, cbIface.addrs).To(BeNil(), "Expected no addresses")
+		ExpectWithOffset(1, cbCIDR.addrCIDRs).To(BeNil(), "Expected no CIDR addresses")
 	}
 	if (addr != "") && (!present) && cbIface.addrs != nil {
 		// Expected addr to be missing
@@ -387,9 +408,19 @@ func (dp *mockDataplane) expectAddrStateCb(ifaceName string, addr string, presen
 			fmt.Sprintf("Expected %v not to contain %v", cbIface.addrs, addr))
 	}
 	if (addr != "") && present {
-		// Expected addr to be present
+		// Expected addr to be present in bare IP set.
 		ExpectWithOffset(1, cbIface.addrs.Contains(addr)).To(BeTrue(),
 			fmt.Sprintf("Expected %v to contain %v", cbIface.addrs, addr))
+		// The CIDR set should contain an entry with this IP as prefix.
+		found := false
+		cbCIDR.addrCIDRs.Iter(func(cidr string) error {
+			if strings.HasPrefix(cidr, addr+"/") {
+				found = true
+			}
+			return nil
+		})
+		ExpectWithOffset(1, found).To(BeTrue(),
+			fmt.Sprintf("Expected CIDR set %v to contain an entry for %v", cbCIDR.addrCIDRs, addr))
 	}
 }
 
@@ -451,12 +482,14 @@ var _ = Describe("ifacemonitor", func() {
 		// expectAddrStateCb takes care to check that we eventually get the callback that we
 		// expect.
 		dp = &mockDataplane{
-			linkC: make(chan linkUpdate, 1),
-			addrC: make(chan addrState, 2),
-			syncC: make(chan inSyncupdate, 1),
+			linkC:     make(chan linkUpdate, 1),
+			addrC:     make(chan addrState, 2),
+			addrCIDRC: make(chan addrCIDRState, 2),
+			syncC:     make(chan inSyncupdate, 1),
 		}
 		im.StateCallback = dp.linkStateCallback
 		im.AddrCallback = dp.addrStateCallback
+		im.AddrCIDRCallback = dp.addrCIDRStateCallback
 		im.InSyncCallback = dp.synchronizationCallBack
 		expectInSync = true
 	})

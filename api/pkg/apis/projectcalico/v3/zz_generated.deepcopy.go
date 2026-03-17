@@ -2036,6 +2036,11 @@ func (in *FelixConfigurationSpec) DeepCopyInto(out *FelixConfigurationSpec) {
 		*out = new(FloatingIPType)
 		**out = **in
 	}
+	if in.ProxyARPEnabled != nil {
+		in, out := &in.ProxyARPEnabled, &out.ProxyARPEnabled
+		*out = new(ProxyARPEnabledMode)
+		**out = **in
+	}
 	if in.WindowsManageFirewallRules != nil {
 		in, out := &in.WindowsManageFirewallRules, &out.WindowsManageFirewallRules
 		*out = new(WindowsManageFirewallRulesMode)

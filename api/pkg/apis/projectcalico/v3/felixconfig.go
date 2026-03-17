@@ -95,6 +95,14 @@ const (
 )
 
 // +kubebuilder:validation:Enum=Enabled;Disabled
+type ProxyARPEnabledMode string
+
+const (
+	ProxyARPEnabledModeEnabled  ProxyARPEnabledMode = "Enabled"
+	ProxyARPEnabledModeDisabled ProxyARPEnabledMode = "Disabled"
+)
+
+// +kubebuilder:validation:Enum=Enabled;Disabled
 type BPFHostNetworkedNATType string
 
 const (
@@ -1061,6 +1069,14 @@ type FelixConfigurationSpec struct {
 	//
 	// +optional
 	FloatingIPs *FloatingIPType `json:"floatingIPs,omitempty" validate:"omitempty"`
+
+	// ProxyARPEnabled controls whether Felix automatically programs per-IP proxy
+	// ARP (IPv4) and proxy NDP (IPv6) entries on host interfaces for local pod IPs
+	// and selected LoadBalancer VIPs that fall within the same subnet as the host
+	// interface. When enabled, pods and LB VIPs on the host subnet are reachable
+	// from the local L2 segment without BGP. [Default: Enabled]
+	// +optional
+	ProxyARPEnabled *ProxyARPEnabledMode `json:"proxyARPEnabled,omitempty" validate:"omitempty,oneof=Enabled Disabled"`
 
 	// WindowsManageFirewallRules configures whether or not Felix will program Windows Firewall rules (to allow inbound access to its own metrics ports). [Default: Disabled]
 	// +optional

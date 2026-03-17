@@ -499,6 +499,11 @@ spec:
                   type: boolean
                 prometheusWireGuardMetricsEnabled:
                   type: boolean
+                proxyARPEnabled:
+                  enum:
+                    - Enabled
+                    - Disabled
+                  type: string
                 removeExternalRoutes:
                   type: boolean
                 reportingInterval:

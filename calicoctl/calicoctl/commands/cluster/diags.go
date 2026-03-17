@@ -745,6 +745,21 @@ func collectCalicoNodeDiags(curNodeDir string, nodeName, namespace, podName stri
 			FilePath: fmt.Sprintf("%s/ip-neigh.txt", curNodeDir),
 		},
 		{
+			Info:     fmt.Sprintf("Collect proxy ARP entries for node %s", nodeName),
+			CmdStr:   fmt.Sprintf("kubectl exec -n %s -t %s -c calico-node -- ip neigh show proxy", namespace, podName),
+			FilePath: fmt.Sprintf("%s/ip-neigh-proxy.txt", curNodeDir),
+		},
+		{
+			Info:     fmt.Sprintf("Collect proxy NDP entries for node %s", nodeName),
+			CmdStr:   fmt.Sprintf("kubectl exec -n %s -t %s -c calico-node -- ip -6 neigh show proxy", namespace, podName),
+			FilePath: fmt.Sprintf("%s/ip-neigh-proxy-v6.txt", curNodeDir),
+		},
+		{
+			Info:     fmt.Sprintf("Collect LB proxy ARP dummy interface routes for node %s", nodeName),
+			CmdStr:   fmt.Sprintf("kubectl exec -n %s -t %s -c calico-node -- ip route show dev cali-lb-arp", namespace, podName),
+			FilePath: fmt.Sprintf("%s/ip-route-cali-lb-arp.txt", curNodeDir),
+		},
+		{
 			Info:     fmt.Sprintf("Collect ipset list for node %s", nodeName),
 			CmdStr:   fmt.Sprintf("kubectl exec -n %s -t %s -c calico-node -- ipset list", namespace, podName),
 			FilePath: fmt.Sprintf("%s/ipset-list.txt", curNodeDir),

@@ -370,6 +370,10 @@ type Config struct {
 	// IPs are always programmed, regardless of this setting.
 	FloatingIPs string `config:"oneof(Enabled,Disabled);Disabled"`
 
+	// ProxyARPEnabled controls whether Felix programs per-IP proxy ARP/NDP entries on host
+	// interfaces for local pod IPs and LB VIPs that overlap the host subnet. [Default: Enabled]
+	ProxyARPEnabled string `config:"oneof(Enabled,Disabled);Enabled"`
+
 	// WindowsManageFirewallRules configures whether or not Felix will program Windows Firewall rules. [Default: Disabled]
 	WindowsManageFirewallRules string `config:"oneof(Enabled,Disabled);Disabled"`
 

@@ -218,6 +218,7 @@ func StartDataplaneDriver(
 			Hostname:           felixHostname,
 			NodeZone:           felixNodeZone,
 			FloatingIPsEnabled: strings.EqualFold(configParams.FloatingIPs, string(apiv3.FloatingIPsEnabled)),
+			ProxyARPEnabled:    configParams.ProxyARPEnabled,
 			IfaceMonitorConfig: ifacemonitor.Config{
 				InterfaceExcludes: configParams.InterfaceExclude,
 				ResyncInterval:    configParams.InterfaceRefreshInterval,
